@@ -1,0 +1,22 @@
+[package]
+name = "horizon-steam"
+version = "0.1.0"
+edition = "2024"
+license = "GPL-3.0-only"
+description = "Play with Steam friends: e4steam's Steam P2P multiplayer, ported to Horizon (a lobby carries the invite, Steam networking sockets carry the game)"
+
+[dependencies]
+# Safe Steamworks bindings (SDK 1.59+): the client, matchmaking, networking
+# sockets and the callbacks this crate pumps. Linked against the SDK
+# redistributable the crate bundles, so the game needs steam_api beside it
+# only when the `steam` feature of horizon-client is on.
+steamworks = { version = "0.13", default-features = false, features = ["raw-bindings"] }
+log = "0.4"
+
+# The launcher workspace denies these like the rest of its crates; this
+# crate keeps the same list so it lints identically in and out of it.
+[lints.clippy]
+too_many_arguments = "allow"
+type_complexity = "allow"
+needless_range_loop = "allow"
+large_enum_variant = "allow"

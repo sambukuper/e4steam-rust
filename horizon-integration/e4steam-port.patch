@@ -1,0 +1,2468 @@
+From 566ee5f588fa85bda441c20844572742224f3d3f Mon Sep 17 00:00:00 2001
+From: sambukuper <sambukuper@users.noreply.github.com>
+Date: Thu, 29 Oct 2026 22:02:31 +0300
+Subject: [PATCH 1/3] Add horizon-steam: e4steam's Steam friends multiplayer,
+ ported
+
+e4steam is a Java mod (Fabric/Forge/NeoForge); Java jars do not run on
+Horizon, so what the mod does arrives natively: the host's world opens to
+a Steam lobby (friends join freely, or only by invitation), guests
+connect over Steam's P2P networking sockets on the mod's own virtual
+port 480, and each session is pumped byte for byte to the integrated
+server's LAN port, as Play with Friends carries its invite-code
+sessions. App ID 480 is the mod's, and so is the identity scheme: a
+guest logs in as s_<steamid in base 36> with the UUID the mod derives
+from the SteamID, and the host's tunnel checks the login name against
+the Steam connection's identity before a byte reaches the server. The
+lobby's metadata (protocol, game, host) keeps foreign App ID 480 traffic
+out, as the mod filters its own.
+
+cargo test -p horizon-steam covers what needs no Steam: the identity
+derivation against vectors computed from the Java algorithm, the
+safe-name round trip, address parsing, and the opening check (a real
+handshake and Hello arriving in pieces, wrong names, a status ping,
+garbage).
+
+Co-Authored-By: ZCode (GLM-5.3-Flash) <noreply@z.ai>
+---
+ Cargo.lock                           |  34 +++
+ Cargo.toml                           |   1 +
+ crates/horizon-steam/Cargo.toml      |  18 ++
+ crates/horizon-steam/src/guard.rs    | 239 +++++++++++++++
+ crates/horizon-steam/src/guest.rs    | 269 +++++++++++++++++
+ crates/horizon-steam/src/identity.rs | 117 +++++++
+ crates/horizon-steam/src/lib.rs      | 213 +++++++++++++
+ crates/horizon-steam/src/share.rs    | 435 +++++++++++++++++++++++++++
+ 8 files changed, 1326 insertions(+)
+ create mode 100644 crates/horizon-steam/Cargo.toml
+ create mode 100644 crates/horizon-steam/src/guard.rs
+ create mode 100644 crates/horizon-steam/src/guest.rs
+ create mode 100644 crates/horizon-steam/src/identity.rs
+ create mode 100644 crates/horizon-steam/src/lib.rs
+ create mode 100644 crates/horizon-steam/src/share.rs
+
+diff --git a/Cargo.lock b/Cargo.lock
+index f048c88d2..387bba5ba 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -1391,6 +1391,7 @@ dependencies = [
+  "horizon-server-files",
+  "horizon-shader-api",
+  "horizon-shaders",
++ "horizon-steam",
+  "horizon-telemetry",
+  "horizon-theme",
+  "horizon-threads",
+@@ -1641,6 +1642,15 @@ dependencies = [
+  "zip",
+ ]
+ 
++[[package]]
++name = "horizon-steam"
++version = "0.1.0"
++dependencies = [
++ "horizon-protocol",
++ "log",
++ "steamworks",
++]
++
+ [[package]]
+ name = "horizon-telemetry"
+ version = "0.1.0"
+@@ -2752,6 +2762,12 @@ dependencies = [
+  "windows-link",
+ ]
+ 
++[[package]]
++name = "paste"
++version = "1.0.15"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "57c0d7b74b563b49d38dae00a0c37d4d6de9b432382b2892f0574ddcae73fd0a"
++
+ [[package]]
+ name = "percent-encoding"
+ version = "2.3.2"
+@@ -3487,6 +3503,24 @@ version = "1.1.0"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "a2eb9349b6444b326872e140eb1cf5e7c522154d69e7a0ffb0fb81c06b37543f"
+ 
++[[package]]
++name = "steamworks"
++version = "0.13.1"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "5ff29921f6a7e8c85b0c971ec3c42002b9f535e3b8f4358cb22911d43709739a"
++dependencies = [
++ "bitflags 2.13.2",
++ "paste",
++ "steamworks-sys",
++ "thiserror 2.0.21",
++]
++
++[[package]]
++name = "steamworks-sys"
++version = "0.13.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "ae139f051204a4af015d4f0ed3a1f7a51020d03a44c7cf249168c543d88131e9"
++
+ [[package]]
+ name = "strict-num"
+ version = "0.1.1"
+diff --git a/Cargo.toml b/Cargo.toml
+index d796da834..b6394a9be 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -22,6 +22,7 @@ members = [
+     "crates/horizon-bench",
+     "crates/horizon-friends",
+     "crates/horizon-relay",
++    "crates/horizon-steam",
+     "crates/horizon-mod-sdk",
+     "crates/horizon-mods",
+     "crates/horizon-mods/tests/guest",
+diff --git a/crates/horizon-steam/Cargo.toml b/crates/horizon-steam/Cargo.toml
+new file mode 100644
+index 000000000..6436f8ff7
+--- /dev/null
++++ b/crates/horizon-steam/Cargo.toml
+@@ -0,0 +1,18 @@
++[package]
++name = "horizon-steam"
++version = "0.1.0"
++edition = "2024"
++license = "GPL-3.0-only"
++description = "Play with Steam friends: e4steam's Steam P2P multiplayer, ported to Horizon (a lobby carries the invite, Steam networking sockets carry the game)"
++
++[dependencies]
++horizon-protocol = { path = "../horizon-protocol" }
++# Safe Steamworks bindings (SDK 1.59+): the client, matchmaking, networking
++# sockets and the callbacks this crate pumps. Linked against the SDK
++# redistributable the crate bundles, so the game needs steam_api beside it
++# only when the `steam` feature of horizon-client is on.
++steamworks = { version = "0.13", default-features = false, features = ["raw-bindings"] }
++log = "0.4"
++
++[lints]
++workspace = true
+diff --git a/crates/horizon-steam/src/guard.rs b/crates/horizon-steam/src/guard.rs
+new file mode 100644
+index 000000000..a31518d80
+--- /dev/null
++++ b/crates/horizon-steam/src/guard.rs
+@@ -0,0 +1,239 @@
++//! The host's check on a guest over Steam: the login name the guest's client
++//! sends must be the safe name of the Steam account the P2P connection is
++//! authenticated as. e4steam derives the guest's identity on the host from
++//! the SteamID and never trusts the connecting client; without the JVM to
++//! swap the profile, this port checks instead: the guest's own client sends
++//! its Steam-derived name ([identity::safe_name](crate::identity::safe_name)),
++//! and a guest that logs in as anything else is refused before a byte of its
++//! stream reaches the integrated server.
++//!
++//! The check reads the guest's first two packets (the handshake's Intention,
++//! then the login's Hello, both uncompressed plaintext before the server
++//! answers) straight from the Steam connection. Anything malformed is
++//! refused: only Horizon's own client joins this way.
++
++use crate::identity;
++
++/// How many bytes of the guest's opening the check reads at most: the two
++/// packets together are a few dozen bytes; anything past this is not a
++/// Horizon join.
++const MAX_OPENING: usize = 1024;
++
++/// What the check found in the guest's opening.
++#[derive(Debug)]
++pub enum Verdict {
++    /// The name carries a SteamID; the caller compares it with the
++    /// connection's. The name is included for the comparison.
++    Allowed(String),
++    /// Not a Horizon join, or the name is not a Steam identity: refuse.
++    Refused(&'static str),
++}
++
++/// A feed of the guest's first bytes, ending in the verdict.
++#[derive(Default)]
++pub struct Opening {
++    buf: Vec<u8>,
++}
++
++impl Opening {
++    /// The next bytes of the guest's opening (hand them over as they arrive).
++    /// Returns the verdict once the Hello's name has been read, `Err(true)`
++    /// while more bytes are wanted (the caller goes on feeding), and
++    /// `Err(false)` when the opening is malformed or too long.
++    pub fn feed(&mut self, bytes: &[u8]) -> Result<Verdict, bool> {
++        if self.buf.len() + bytes.len() > MAX_OPENING {
++            return Err(false);
++        }
++        self.buf.extend_from_slice(bytes);
++        let mut cursor = 0;
++        // Intention: the handshake's first packet. Only a login intent goes on.
++        let (id, body_end, rest) = packet(&self.buf, cursor).ok_or(false)?;
++        if id != 0 {
++            return Err(false);
++        }
++        cursor = body_end;
++        match Intention::read(rest) {
++            Some(intent) if intent.login => {}
++            _ => return Err(false),
++        }
++        // Hello: the login's first packet, carrying the name.
++        let (id, _, rest) = packet(&self.buf, cursor).ok_or(false)?;
++        if id != 0 {
++            return Err(false);
++        }
++        let Some(hello) = Hello::read(rest) else {
++            return Err(false);
++        };
++        match identity::steam_id_of(&hello.name) {
++            Some(_) => Ok(Verdict::Allowed(hello.name)),
++            None => Ok(Verdict::Refused(
++                "the guest's login name is not a Steam identity",
++            )),
++        }
++    }
++}
++
++/// One packet from `buf[cursor..]`: its id, where the packet ends (an index
++/// into the whole buffer) and the body. `None` while the whole packet hasn't
++/// arrived.
++fn packet(buf: &[u8], cursor: usize) -> Option<(i32, usize, &[u8])> {
++    let (length, header) = varint(&buf[cursor..])?;
++    if !(0..=4096).contains(&length) {
++        return None;
++    }
++    let end = cursor + header + length as usize;
++    if buf.len() < end {
++        return None;
++    }
++    let (id, id_len) = varint(&buf[cursor + header..end])?;
++    Some((id, end, &buf[cursor + header + id_len..end]))
++}
++
++/// The handshake's Intention: protocol, host, port, next state.
++struct Intention {
++    login: bool,
++}
++
++impl Intention {
++    fn read(body: &[u8]) -> Option<Self> {
++        let (_, used) = varint(body)?; // protocol version
++        let rest = &body[used..];
++        let (host_len, used) = varint(rest)?;
++        if host_len < 0 || rest.len() < used + host_len as usize + 3 {
++            return None;
++        }
++        let rest = &rest[used + host_len as usize..];
++        let (state, _) = varint(&rest[2..])?; // past the port
++        Some(Self { login: state == 2 })
++    }
++}
++
++/// The login's Hello: the player's name (and the client's uuid, which the
++/// offline server ignores).
++struct Hello {
++    name: String,
++}
++
++impl Hello {
++    fn read(body: &[u8]) -> Option<Self> {
++        let (len, used) = varint(body)?;
++        if len < 0 || body.len() < used + len as usize {
++            return None;
++        }
++        let name = String::from_utf8(body[used..used + len as usize].to_vec()).ok()?;
++        if name.chars().count() > 16 {
++            return None;
++        }
++        Some(Self { name })
++    }
++}
++
++/// A protocol varint: the value and how many bytes it took.
++fn varint(buf: &[u8]) -> Option<(i32, usize)> {
++    let mut value = 0i32;
++    for (i, &b) in buf.iter().take(5).enumerate() {
++        value |= i32::from(b & 0x7f) << (i * 7);
++        if b & 0x80 == 0 {
++            return Some((value, i + 1));
++        }
++    }
++    None
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    fn put_varint(mut value: i32, out: &mut Vec<u8>) {
++        loop {
++            let byte = (value & 0x7f) as u8;
++            value = ((value as u32) >> 7) as i32;
++            if value == 0 {
++                out.push(byte);
++                return;
++            }
++            out.push(byte | 0x80);
++        }
++    }
++
++    fn put_string(s: &str, out: &mut Vec<u8>) {
++        put_varint(s.len() as i32, out);
++        out.extend_from_slice(s.as_bytes());
++    }
++
++    fn frame(id: i32, body: &[u8]) -> Vec<u8> {
++        let mut out = Vec::new();
++        put_varint(body.len() as i32 + 1, &mut out); // + the packet id
++        put_varint(id, &mut out);
++        out.extend_from_slice(body);
++        out
++    }
++
++    /// Intention (login) and Hello packets as Horizon's client sends them.
++    fn opening(name: &str) -> Vec<u8> {
++        let mut handshake = Vec::new();
++        put_varint(763, &mut handshake);
++        put_string("127.0.0.1", &mut handshake);
++        handshake.extend_from_slice(&25565u16.to_be_bytes());
++        put_varint(2, &mut handshake); // next state: login
++        let mut hello = Vec::new();
++        put_string(name, &mut hello);
++        hello.extend_from_slice(&[0u8; 16]); // the client's uuid
++        [frame(0, &handshake), frame(0, &hello)].concat()
++    }
++
++    fn verdict(name: &str) -> Result<Verdict, bool> {
++        let mut check = Opening::default();
++        check.feed(&opening(name))
++    }
++
++    #[test]
++    fn a_steam_safe_name_passes() {
++        assert!(matches!(
++            verdict("s_kxuogshzmyo"),
++            Ok(Verdict::Allowed(name)) if name == "s_kxuogshzmyo"
++        ));
++    }
++
++    #[test]
++    fn any_other_name_is_refused() {
++        for name in ["Steve", "host", "s_"] {
++            assert!(
++                matches!(verdict(name), Ok(Verdict::Refused(_))),
++                "{name} was not refused"
++            );
++        }
++    }
++
++    #[test]
++    fn bytes_arriving_in_pieces_still_parse() {
++        let bytes = opening("s_3dk6el9t85j");
++        let mut check = Opening::default();
++        let mut verdict = Err(true);
++        for chunk in bytes.chunks(3) {
++            verdict = check.feed(chunk);
++            if verdict.is_ok() {
++                break;
++            }
++        }
++        assert!(matches!(verdict, Ok(Verdict::Allowed(_))));
++    }
++
++    #[test]
++    fn a_status_ping_is_not_a_join() {
++        // next state 1: the client asks the server's status, it isn't joining.
++        let mut handshake = Vec::new();
++        put_varint(763, &mut handshake);
++        put_string("127.0.0.1", &mut handshake);
++        handshake.extend_from_slice(&25565u16.to_be_bytes());
++        put_varint(1, &mut handshake);
++        let mut check = Opening::default();
++        assert!(matches!(check.feed(&frame(0, &handshake)), Err(false)));
++    }
++
++    #[test]
++    fn garbage_is_refused_without_hanging() {
++        let mut check = Opening::default();
++        assert!(matches!(check.feed(&[0xff; 40]), Err(false)));
++    }
++}
+diff --git a/crates/horizon-steam/src/guest.rs b/crates/horizon-steam/src/guest.rs
+new file mode 100644
+index 000000000..405d64fc2
+--- /dev/null
++++ b/crates/horizon-steam/src/guest.rs
+@@ -0,0 +1,269 @@
++//! The guest's end: join the host's lobby, check it is a Horizon world of
++//! this game's version, connect to the host over Steam's P2P network, then
++//! offer the session on a loopback port the client connects to like to any
++//! server. Joining logs in as this player's own Steam identity
++//! ([identity](crate::identity)); the host's check ([guard](crate::guard))
++//! expects exactly that.
++use crate::VIRTUAL_PORT;
++use std::{
++    fmt, io,
++    net::{Ipv4Addr, TcpListener, TcpStream},
++    thread::JoinHandle,
++    time::{Duration, Instant},
++};
++use steamworks::networking_sockets::NetConnection;
++use steamworks::networking_types::{
++    AppNetConnectionEnd, NetConnectionEnd, NetworkingConnectionState, NetworkingIdentity,
++};
++use steamworks::{LobbyId, SteamId};
++
++/// How a join is set up.
++pub struct GuestConfig {
++    /// The lobby as pasted: a `steam:<id>` address, or the bare id.
++    pub lobby: String,
++    /// This game's protocol number: a lobby whose protocol differs is
++    /// refused before connecting, as the friends relay refuses a guest.
++    pub protocol: i32,
++    /// This game's version name, for the mismatch message.
++    pub game: String,
++}
++
++/// Why joining failed, in words for the player.
++#[derive(Debug)]
++pub enum JoinError {
++    /// Steam isn't running or refused the game.
++    NoSteam(String),
++    /// Not a `steam:<id>` address.
++    BadAddress,
++    /// No lobby with this id, or it ended.
++    LobbyGone,
++    /// The lobby holds no Horizon metadata: it belongs to another program on
++    /// the shared App ID 480, as e4steam filters its own traffic.
++    NotHorizon,
++    /// The host's world is another game version.
++    VersionMismatch {
++        host: Option<String>,
++        mine: String,
++    },
++    /// The lobby is full.
++    Full,
++    /// The host's game didn't take the connection.
++    HostUnreachable,
++    Failed(String),
++}
++impl fmt::Display for JoinError {
++    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
++        match self {
++            Self::NoSteam(e) => write!(f, "{e}"),
++            Self::BadAddress => write!(
++                f,
++                "That's not a Steam world's address: it should be steam: followed by a number from your friend's Play with Friends screen."
++            ),
++            Self::LobbyGone => write!(
++                f,
++                "No Steam world uses this address. Check it, or ask your friend to start sharing again."
++            ),
++            Self::NotHorizon => write!(
++                f,
++                "This Steam lobby isn't a Horizon world. Check the address."
++            ),
++            Self::VersionMismatch {
++                host: Some(v),
++                mine,
++            } => {
++                write!(f, "Your friend plays Minecraft {v}; you have {mine}.")
++            }
++            Self::VersionMismatch { host: None, mine } => {
++                write!(
++                    f,
++                    "Your friend plays another version of Minecraft than {mine}."
++                )
++            }
++            Self::Full => write!(f, "Your friend's world is full."),
++            Self::HostUnreachable => write!(f, "Your friend's game didn't answer."),
++            Self::Failed(e) => write!(f, "Couldn't connect to your friend ({e})."),
++        }
++    }
++}
++impl std::error::Error for JoinError {}
++
++/// A settled session: the Steam connection carrying the game.
++pub struct Tunnel {
++    conn: NetConnection,
++}
++
++/// Join the lobby of the address: read the host's metadata, connect, wait
++/// for Steam to route the two. Blocks for a few seconds.
++pub fn join(config: &GuestConfig) -> Result<Tunnel, JoinError> {
++    let steam = crate::acquire().map_err(JoinError::NoSteam)?;
++    let id = crate::parse_lobby_address(config.lobby.trim())
++        .or_else(|| config.lobby.trim().parse().ok())
++        .ok_or(JoinError::BadAddress)?;
++    let client = steam.client();
++    let (joined, joined_rx) = std::sync::mpsc::channel();
++    client
++        .matchmaking()
++        .join_lobby(LobbyId::from_raw(id), move |r| {
++            let _ = joined.send(r);
++        });
++    let lobby = joined_rx
++        .recv_timeout(Duration::from_secs(10))
++        .map_err(|_| JoinError::Failed("Steam didn't answer the join".into()))?
++        .map_err(|_| JoinError::LobbyGone)?;
++    let mm = client.matchmaking();
++    // The lobby's own metadata says whether it is a Horizon world at all and
++    // whether it is this game's version: on the shared App ID 480 that is
++    // what keeps another program's lobby out, as e4steam filters its traffic.
++    let protocol = mm.lobby_data(lobby, crate::LOBBY_KEY_PROTOCOL);
++    let Some(protocol) = protocol.and_then(|p| p.parse::<i32>().ok()) else {
++        mm.leave_lobby(lobby);
++        return Err(JoinError::NotHorizon);
++    };
++    if protocol != config.protocol {
++        mm.leave_lobby(lobby);
++        return Err(JoinError::VersionMismatch {
++            host: mm.lobby_data(lobby, crate::LOBBY_KEY_GAME),
++            mine: config.game.clone(),
++        });
++    }
++    let host = mm
++        .lobby_data(lobby, crate::LOBBY_KEY_HOST)
++        .and_then(|h| h.parse::<u64>().ok())
++        .filter(|h| *h != 0)
++        .unwrap_or_else(|| mm.lobby_owner(lobby).raw());
++    if mm
++        .lobby_member_limit(lobby)
++        .is_some_and(|limit| mm.lobby_member_count(lobby) >= limit)
++    {
++        mm.leave_lobby(lobby);
++        return Err(JoinError::Full);
++    }
++    let conn = client
++        .networking_sockets()
++        .connect_p2p(
++            NetworkingIdentity::new_steam_id(SteamId::from_raw(host)),
++            VIRTUAL_PORT,
++            [],
++        )
++        .map_err(|_| {
++            mm.leave_lobby(lobby);
++            JoinError::HostUnreachable
++        })?;
++    // Steam finds the route (direct when it can, Valve's relays when not);
++    // the host's answer completes it.
++    let deadline = Instant::now() + Duration::from_secs(15);
++    loop {
++        match conn.try_receive_event() {
++            Some(event) => match event.new_state {
++                NetworkingConnectionState::Connected => break,
++                NetworkingConnectionState::ClosedByPeer
++                | NetworkingConnectionState::ProblemDetectedLocally
++                | NetworkingConnectionState::None => {
++                    mm.leave_lobby(lobby);
++                    return Err(JoinError::HostUnreachable);
++                }
++                _ => {}
++            },
++            None => {
++                if Instant::now() > deadline {
++                    mm.leave_lobby(lobby);
++                    return Err(JoinError::HostUnreachable);
++                }
++                std::thread::sleep(Duration::from_millis(10));
++            }
++        }
++    }
++    // The host checks that we log in as our own Steam identity: the login
++    // name is decided here, in net.rs, from the same derivation.
++    Ok(Tunnel { conn })
++}
++
++impl Tunnel {
++    /// Offer the session on `127.0.0.1:port` for one connection (the game's
++    /// client), as the friends tunnel does; the returned thread ends when
++    /// that connection does.
++    pub fn serve_loopback(self) -> io::Result<(u16, JoinHandle<()>)> {
++        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))?;
++        let port = listener.local_addr()?.port();
++        listener.set_nonblocking(true)?;
++        let thread = std::thread::Builder::new()
++            .name("horizon-steam-guest".into())
++            .spawn(move || {
++                let deadline = Instant::now() + Duration::from_secs(30);
++                let plain = loop {
++                    match listener.accept() {
++                        Ok((s, from)) if from.ip().is_loopback() => break Some(s),
++                        Ok(_) => {}
++                        Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
++                            if Instant::now() > deadline {
++                                break None;
++                            }
++                            std::thread::sleep(Duration::from_millis(10));
++                        }
++                        Err(_) => break None,
++                    }
++                };
++                drop(listener);
++                let mut conn = self.conn;
++                let Some(mut plain) = plain else {
++                    let _ = conn.close(
++                        NetConnectionEnd::App(AppNetConnectionEnd::generic_normal()),
++                        None,
++                        false,
++                    );
++                    return;
++                };
++                let _ = plain.set_nodelay(true);
++                carry(&mut conn, &mut plain);
++            })?;
++        Ok((port, thread))
++    }
++}
++
++/// The pump: Steam messages to the game's client, its bytes to Steam, until
++/// either side ends. Both sides are polled (a blocking read could sit on one
++/// while the other side's answer waits), a millisecond when idle.
++fn carry(conn: &mut NetConnection, plain: &mut TcpStream) {
++    use std::io::{Read, Write};
++    let _ = plain.set_nonblocking(true);
++    let mut buf = vec![0u8; 32 * 1024];
++    loop {
++        let mut idle = true;
++        if let Ok(messages) = conn.receive_messages(64) {
++            for message in messages {
++                if plain.write_all(message.data()).is_err() {
++                    return;
++                }
++                idle = false;
++            }
++        }
++        if let Some(event) = conn.try_receive_event()
++            && matches!(
++                event.new_state,
++                NetworkingConnectionState::ClosedByPeer
++                    | NetworkingConnectionState::ProblemDetectedLocally
++                    | NetworkingConnectionState::None
++            )
++        {
++            return;
++        }
++        match plain.read(&mut buf) {
++            Ok(0) => return,
++            Ok(n) => {
++                let Ok(_) = conn.send_message(
++                    &buf[..n],
++                    steamworks::networking_types::SendFlags::RELIABLE
++                        | steamworks::networking_types::SendFlags::NO_NAGLE,
++                ) else {
++                    return;
++                };
++                idle = false;
++            }
++            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
++            Err(_) => return,
++        }
++        if idle {
++            std::thread::sleep(Duration::from_millis(1));
++        }
++    }
++}
+diff --git a/crates/horizon-steam/src/identity.rs b/crates/horizon-steam/src/identity.rs
+new file mode 100644
+index 000000000..da6233ffc
+--- /dev/null
++++ b/crates/horizon-steam/src/identity.rs
+@@ -0,0 +1,117 @@
++//! The Minecraft identity of a Steam account, as e4steam 0.3.0 derives it
++//! (`SteamMinecraftIdentity`): a stable UUID and a safe name that depend on
++//! the authenticated SteamID alone, never on the name a client sends.
++//!
++//! The UUID is the mod's own: a version-3 UUID (Java's
++//! `UUID.nameUUIDFromBytes`) of `e4steam:steam-identity:v1:<steam id>`, so a
++//! world a guest's progress was saved under through the Java mod maps to the
++//! same UUID here. The safe name is `s_` + the SteamID in base 36, which
++//! fits Minecraft's name rules (16 letters, digits and underscores) and is
++//! what the guest logs in as ([guard](crate::guard) checks it on the host).
++
++use horizon_protocol::crypto::md5;
++use steamworks::SteamId;
++
++const UUID_NAMESPACE: &str = "e4steam:steam-identity:v1:";
++const NAME_PREFIX: &str = "s_";
++
++/// A stable, versioned Minecraft UUID for one SteamID (e4steam's
++/// `SteamMinecraftIdentity.uuid`).
++pub fn uuid(steam_id: u64) -> u128 {
++    let material = format!("{UUID_NAMESPACE}{steam_id}");
++    let mut h = md5(material.as_bytes());
++    h[6] = (h[6] & 0x0f) | 0x30;
++    h[8] = (h[8] & 0x3f) | 0x80;
++    u128::from_be_bytes(h)
++}
++
++/// The UUID as players and servers write it.
++pub fn uuid_string(steam_id: u64) -> String {
++    horizon_protocol::crypto::uuid_string(uuid(steam_id))
++}
++
++/// A Minecraft-compatible name derived from the SteamID (e4steam's
++/// `safeName`): the Steam persona name is shown nowhere it would be trusted.
++pub fn safe_name(steam_id: u64) -> String {
++    format!("{NAME_PREFIX}{}", base36(steam_id))
++}
++
++/// The SteamID a safe name carries, for the host's join check.
++pub fn steam_id_of(name: &str) -> Option<u64> {
++    let id = name.strip_prefix(NAME_PREFIX)?;
++    // A u64 in base 36 is at most 13 digits ("s_" + 13 stays within
++    // Minecraft's 16); anything longer is not one of this scheme's names.
++    if id.is_empty() || id.len() > 13 {
++        return None;
++    }
++    u64::from_str_radix(id, 36).ok()
++}
++
++/// The safe name a guest over Steam must log in with.
++pub fn expected_name(steam_id: SteamId) -> String {
++    safe_name(steam_id.raw())
++}
++
++fn base36(mut n: u64) -> String {
++    const DIGITS: &[u8; 36] = b"0123456789abcdefghijklmnopqrstuvwxyz";
++    if n == 0 {
++        return "0".into();
++    }
++    let mut out = Vec::new();
++    while n > 0 {
++        out.push(DIGITS[(n % 36) as usize]);
++        n /= 36;
++    }
++    out.reverse(); // Java's Long.toString writes the high digit first
++    String::from_utf8(out).unwrap()
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    /// Vectors computed against the Java algorithm
++    /// (`UUID.nameUUIDFromBytes("e4steam:steam-identity:v1:" + id)` and
++    /// `Long.toString(id, 36)`), e4steam's `SteamMinecraftIdentity`.
++    #[test]
++    fn matches_the_java_mods_derivation() {
++        for (steam_id, uuid, name) in [
++            (
++                76561197960265728,
++                "6dd93370-5365-38a4-9daa-17484fc197fc",
++                "s_kxuogshzmyo",
++            ),
++            (
++                12345678901234567,
++                "9cfb726f-27f4-385e-8602-fff058d4a4b6",
++                "s_3dk6el9t85j",
++            ),
++        ] {
++            assert_eq!(uuid_string(steam_id), uuid);
++            assert_eq!(safe_name(steam_id), name);
++            assert_eq!(steam_id_of(name), Some(steam_id));
++            // The derived UUID is a v3 one, like Java's nameUUIDFromBytes.
++            assert_eq!(&uuid[14..15], "3");
++        }
++    }
++
++    #[test]
++    fn a_safe_name_is_a_legal_minecraft_name() {
++        for id in [1, 480, 76561197960265728, u64::MAX] {
++            let name = safe_name(id);
++            assert!(name.len() <= 16, "{name} is too long");
++            assert!(
++                name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'),
++                "{name} holds an illegal character"
++            );
++            assert_eq!(steam_id_of(&name), Some(id));
++        }
++    }
++
++    #[test]
++    fn other_names_carry_no_steam_id() {
++        for name in ["", "s_", "s", "s_", "Steve", "s_zzzzzzzzzzzzzzzzzzz", "S_1"] {
++            assert_eq!(steam_id_of(name), None, "{name} parsed");
++        }
++    }
++}
+diff --git a/crates/horizon-steam/src/lib.rs b/crates/horizon-steam/src/lib.rs
+new file mode 100644
+index 000000000..059319553
+--- /dev/null
++++ b/crates/horizon-steam/src/lib.rs
+@@ -0,0 +1,213 @@
++//! Play with Steam friends: e4steam's multiplayer, ported to Horizon.
++//!
++//! e4steam is a Java mod (Fabric / Forge / NeoForge) that opens a singleplayer
++//! world to Steam friends without port forwarding; Java mod jars do not run on
++//! Horizon, so this crate brings what it does natively: the host creates a
++//! Steam lobby behind its world, friends join from a Steam invite or the
++//! lobby's address, and the game's stream travels over Steam's encrypted P2P
++//! networking between the two ends of the integrated server — the same shape
++//! as Play with Friends ([horizon_friends]), with Steam as the transport.
++//!
++//! What is carried over from the mod, and how:
++//!
++//! - **App ID 480.** e4steam permanently uses Valve's shared test App ID
++//!   (Spacewar) so no Steam app of its own is needed, and filters unrelated
++//!   App ID 480 traffic. So does this port: the lobby holds Horizon's own
++//!   metadata keys (below) and a join is refused when they are missing, so a
++//!   lobby from any other App ID 480 program is not joinable by mistake.
++//! - **Access modes.** A *Steam friends* lobby (friends join freely) or an
++//!   *invitation only* one (joining needs the host's invite), like the mod's
++//!   "Open to LAN → Steam friends" and "Invitation only".
++//! - **Identity.** e4steam 0.3.0 derives each guest's stable Minecraft
++//!   identity from the authenticated SteamID instead of trusting the name the
++//!   client sends. This port keeps the mod's scheme ([identity]): the name
++//!   `s_<steamid in base 36>` and the UUID the mod derives for the SteamID.
++//!   The host's tunnel checks the name the guest logs in with against its
++//!   Steam connection's identity and refuses a mismatch, so a guest cannot
++//!   join under another name than its Steam account's ([guard]).
++//! - **Virtual port 480** for the listen socket, as the mod's dedicated
++//!   transport uses.
++//!
++//! Not ported (yet): the dedicated-server Steam mode (the mod's anonymous
++//! GameServer sign-in and `d-...steam` addresses) and the UDP voice-chat
++//! bridge (Horizon has no Java voice mods). The `steamworks` crate version
++//! and this crate's lobby keys are not shared with the Java mod: a Java
++//! e4steam host and a Horizon guest cannot interop (Horizon cannot run the
++//! mod's Java code either way).
++//!
++//! [horizon_friends]: https://docs.rs/horizon-friends
++pub mod guard;
++pub mod guest;
++pub mod identity;
++pub mod share;
++
++use steamworks::Client;
++
++/// Steam's shared test App ID (Spacewar), as e4steam uses.
++pub const APP_ID: u32 = 480;
++/// The virtual port of the host's P2P listen socket (e4steam's own).
++pub const VIRTUAL_PORT: i32 = 480;
++/// The address prefix a guest pastes: `steam:<lobby id>` (the host's screen
++/// shows and copies it).
++pub const ADDRESS_PREFIX: &str = "steam:";
++/// Lobby metadata: the game's protocol number, as e4steam keys its lobbies.
++pub const LOBBY_KEY_PROTOCOL: &str = "horizon_protocol";
++/// Lobby metadata: the game's version name, for the mismatch message.
++pub const LOBBY_KEY_GAME: &str = "horizon_game";
++/// Lobby metadata: the host's SteamID (where the P2P connection goes).
++pub const LOBBY_KEY_HOST: &str = "horizon_host";
++/// Guests at once, like the integrated server's own limit.
++pub const MAX_GUESTS: usize = 8;
++/// Lobby members at once (the host is one of them).
++pub const MAX_LOBBY_MEMBERS: u32 = MAX_GUESTS as u32 + 1;
++
++/// Something the Steam runtime told us, on the callback thread.
++#[derive(Clone, Copy, Debug)]
++pub enum SteamEvent {
++    /// A lobby's membership changed (`LobbyChatUpdate`).
++    LobbyMemberChanged {
++        lobby: u64,
++        member: u64,
++        entered: bool,
++    },
++    /// The player accepted a Steam invite while the game runs
++    /// (`GameLobbyJoinRequested`): the lobby to join.
++    JoinRequested { lobby: u64 },
++}
++
++/// The process's Steam runtime: the client and the thread that pumps its
++/// callbacks. One per process; acquired on demand and never shut down (the
++/// game ends with the process).
++pub struct Steam {
++    client: Client,
++    subscribers: std::sync::Mutex<Vec<std::sync::mpsc::Sender<SteamEvent>>>,
++}
++
++static RUNTIME: std::sync::OnceLock<Result<std::sync::Arc<Steam>, String>> =
++    std::sync::OnceLock::new();
++
++/// The runtime, started on first use: `Err` when Steam isn't running or its
++/// API refused us (the message is for the player, in e4steam's
++/// troubleshooting spirit).
++pub fn acquire() -> Result<std::sync::Arc<Steam>, String> {
++    RUNTIME
++        .get_or_init(start)
++        .as_ref()
++        .map_err(|e| e.clone())
++        .cloned()
++}
++
++/// Whether Steam sharing can be offered (Steam is running and signed in).
++/// False without the client's `steam` feature: the runtime is not linked.
++pub fn available() -> bool {
++    acquire().is_ok()
++}
++
++/// This player's SteamID, when Steam is available.
++pub fn own_steam_id() -> Option<u64> {
++    acquire().ok().map(|s| s.client.user().steam_id().raw())
++}
++
++/// This player's persona name, when Steam is available.
++pub fn persona_name() -> Option<String> {
++    acquire().ok().map(|s| s.client.friends().name())
++}
++
++/// Receive the events Steam's callbacks produce (invites accepted, lobby
++/// members coming and going). Each call adds a receiver; drop it to leave.
++pub fn subscribe() -> Result<std::sync::mpsc::Receiver<SteamEvent>, String> {
++    let steam = acquire()?;
++    let (tx, rx) = std::sync::mpsc::channel();
++    steam.subscribers.lock().unwrap().push(tx);
++    Ok(rx)
++}
++
++fn start() -> Result<std::sync::Arc<Steam>, String> {
++    // App ID 480 without a steam_appid.txt beside the game: the SDK reads the
++    // `SteamAppId` environment variable, which `init_app` sets.
++    let client = Client::init_app(APP_ID)
++        .map_err(|e| format!("Steam isn't running, or refused Horizon ({e}). Start Steam and sign in, then restart the game."))?;
++    let steam = std::sync::Arc::new(Steam {
++        client,
++        subscribers: std::sync::Mutex::new(Vec::new()),
++    });
++    // One thread pumps every callback, all the time: lobby results, invites
++    // and the networking sockets' connection events are delivered during it.
++    std::thread::Builder::new()
++        .name("horizon-steam-callbacks".into())
++        .spawn({
++            let steam = steam.clone();
++            move || loop {
++                steam.client.run_callbacks();
++                std::thread::sleep(std::time::Duration::from_millis(10));
++            }
++        })
++        .map_err(|e| format!("Steam's callback thread could not start: {e}"))?;
++    steam.client.register_callback({
++        let steam = steam.clone();
++        move |update: steamworks::LobbyChatUpdate| {
++            steam.announce(SteamEvent::LobbyMemberChanged {
++                lobby: update.lobby.raw(),
++                member: update.user_changed.raw(),
++                entered: update.member_state_change == steamworks::ChatMemberStateChange::Entered,
++            });
++        }
++    });
++    steam.client.register_callback({
++        let steam = steam.clone();
++        move |requested: steamworks::GameLobbyJoinRequested| {
++            // The player accepted an invite in the overlay; the client's
++            // Steam screen turns it into a join.
++            steam.announce(SteamEvent::JoinRequested {
++                lobby: requested.lobby_steam_id.raw(),
++            });
++        }
++    });
++    log::info!(
++        "Steam is ready: app id {APP_ID}, persona '{}'",
++        persona_name().unwrap_or_default()
++    );
++    Ok(steam)
++}
++
++impl Steam {
++    /// Send an event to every subscriber.
++    pub(crate) fn announce(&self, event: SteamEvent) {
++        self.subscribers
++            .lock()
++            .unwrap()
++            .retain(|tx| tx.send(event).is_ok());
++    }
++    pub(crate) fn client(&self) -> &Client {
++        &self.client
++    }
++}
++
++/// The address a host's lobby is joined by: `steam:<lobby id>`.
++pub fn lobby_address(lobby: u64) -> String {
++    format!("{ADDRESS_PREFIX}{lobby}")
++}
++
++/// The lobby id in a `steam:<lobby id>` address.
++pub fn parse_lobby_address(address: &str) -> Option<u64> {
++    address
++        .strip_prefix(ADDRESS_PREFIX)
++        .and_then(|id| id.trim().parse().ok())
++        .filter(|id| *id != 0)
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn lobby_addresses_round_trip() {
++        let id = 109775241234567890;
++        assert_eq!(parse_lobby_address(&lobby_address(id)), Some(id));
++        assert_eq!(parse_lobby_address("steam: 109775241234567890"), Some(id));
++        assert_eq!(parse_lobby_address("steam:0"), None);
++        assert_eq!(parse_lobby_address("steam:"), None);
++        assert_eq!(parse_lobby_address("steam:none"), None);
++        assert_eq!(parse_lobby_address("friend:K7QM-3XPD"), None);
++    }
++}
+diff --git a/crates/horizon-steam/src/share.rs b/crates/horizon-steam/src/share.rs
+new file mode 100644
+index 000000000..cdd739539
+--- /dev/null
++++ b/crates/horizon-steam/src/share.rs
+@@ -0,0 +1,435 @@
++//! The host's Steam share: a lobby carries the invite (Steam friends join
++//! freely, or only by invitation), a P2P listen socket carries the game.
++//! Every guest's connection is checked ([guard](crate::guard)) and then
++//! pumped to the integrated server's loopback port byte for byte, as Play
++//! with Friends carries its sessions: the server never sees the difference.
++//! Steam encrypts the transport; identity is the Steam account.
++use crate::{
++    MAX_GUESTS, VIRTUAL_PORT,
++    guard::{self, Opening},
++    identity,
++};
++use std::{
++    collections::HashMap,
++    io::{self, Read, Write},
++    net::{Shutdown, SocketAddr, TcpStream},
++    sync::{
++        Arc, Mutex,
++        atomic::{AtomicBool, Ordering},
++        mpsc::{Receiver, Sender, channel},
++    },
++    thread::JoinHandle,
++    time::{Duration, Instant},
++};
++use steamworks::networking_sockets::NetConnection;
++use steamworks::networking_types::{
++    AppNetConnectionEnd, ListenSocketEvent, NetConnectionEnd, NetworkingConnectionState,
++    NetworkingMessage,
++};
++use steamworks::{LobbyId, LobbyType, SteamId};
++
++/// Who may join.
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub enum Access {
++    /// Steam friends join freely (e4steam's "Steam friends").
++    Friends,
++    /// Joining needs the host's invitation (e4steam's "Invitation only";
++    /// invitations go through the Steam overlay).
++    Invitation,
++}
++
++/// How the share is set up.
++pub struct ShareConfig {
++    /// The integrated server's loopback address (Open to LAN's port).
++    pub lan: SocketAddr,
++    /// The game's protocol number: a guest's lobby check refuses a mismatch
++    /// before any connection is made.
++    pub protocol: i32,
++    /// The game's version name, for the same message.
++    pub game: String,
++    pub access: Access,
++}
++
++/// What the host's game shows.
++#[derive(Clone, Debug, Default)]
++pub struct ShareState {
++    /// The lobby's address (`steam:<id>`), once Steam made the lobby.
++    pub address: Option<String>,
++    /// The safe names of the guests being carried.
++    pub guests: Vec<String>,
++    /// Why Steam sharing isn't serving, when the player asked for it.
++    pub problem: Option<String>,
++}
++
++/// What the share reports, polled like a tick.
++#[derive(Debug)]
++pub enum ShareEvent {
++    /// The lobby is ready (its address).
++    Lobby(String),
++    /// A guest's session is being carried.
++    GuestJoined { steam_id: u64 },
++    /// The guest's session ended.
++    GuestLeft { steam_id: u64 },
++}
++
++struct Inner {
++    config: ShareConfig,
++    lobby: Mutex<Option<LobbyId>>,
++    listen: Mutex<Option<steamworks::networking_sockets::ListenSocket>>,
++    events: Mutex<Sender<ShareEvent>>,
++    state: Mutex<ShareState>,
++    guests: Mutex<HashMap<u64, ()>>,
++    stop: AtomicBool,
++}
++
++impl Inner {
++    fn emit(&self, event: ShareEvent) {
++        let _ = self.events.lock().unwrap().send(event);
++    }
++    /// Whether the Steam account may connect now: room at the server and a
++    /// seat in the lobby (which Steam fills by friendship or invitation,
++    /// whichever the host chose).
++    fn admitted(&self, steam: &crate::Steam, id: SteamId) -> bool {
++        self.guests.lock().unwrap().len() < MAX_GUESTS && self.is_member(steam, id)
++    }
++    fn is_member(&self, steam: &crate::Steam, id: SteamId) -> bool {
++        self.lobby.lock().unwrap().is_some_and(|lobby| {
++            steam
++                .client()
++                .matchmaking()
++                .lobby_members(lobby)
++                .contains(&id)
++        })
++    }
++}
++
++/// The host's end, like `horizon_friends::Host`: started in the background,
++/// the game polls it.
++pub struct Share {
++    inner: Arc<Inner>,
++    events: Receiver<ShareEvent>,
++    threads: Mutex<Vec<JoinHandle<()>>>,
++}
++
++impl Share {
++    /// Start sharing: create the lobby (a few seconds at most), publish the
++    /// address, listen for friends on virtual port 480.
++    pub fn start(config: ShareConfig) -> Result<Self, String> {
++        let steam = crate::acquire()?;
++        let client = steam.client();
++        let (tx, events) = channel();
++        let (created, created_rx) = channel();
++        let ty = match config.access {
++            Access::Friends => LobbyType::FriendsOnly,
++            Access::Invitation => LobbyType::Private,
++        };
++        client
++            .matchmaking()
++            .create_lobby(ty, crate::MAX_LOBBY_MEMBERS, move |r| {
++                let _ = created.send(r);
++            });
++        let lobby = created_rx
++            .recv_timeout(Duration::from_secs(10))
++            .map_err(|_| "Steam didn't answer the lobby request".to_owned())?
++            .map_err(|e| format!("Steam refused the lobby ({e}). Restart Steam and try again."))?;
++        let host = client.user().steam_id();
++        let mm = client.matchmaking();
++        mm.set_lobby_data(
++            lobby,
++            crate::LOBBY_KEY_PROTOCOL,
++            &config.protocol.to_string(),
++        );
++        mm.set_lobby_data(lobby, crate::LOBBY_KEY_GAME, &config.game);
++        mm.set_lobby_data(lobby, crate::LOBBY_KEY_HOST, &host.raw().to_string());
++        if !mm.set_lobby_joinable(lobby, true) {
++            return Err("Steam wouldn't make the lobby joinable".into());
++        }
++        let listen = client
++            .networking_sockets()
++            .create_listen_socket_p2p(VIRTUAL_PORT, [])
++            .map_err(|_| "Steam wouldn't open the world's P2P listener".to_owned())?;
++        let address = crate::lobby_address(lobby.raw());
++        let inner = Arc::new(Inner {
++            config,
++            lobby: Mutex::new(Some(lobby)),
++            listen: Mutex::new(Some(listen)),
++            events: Mutex::new(tx),
++            state: Mutex::new(ShareState {
++                address: Some(address.clone()),
++                ..ShareState::default()
++            }),
++            guests: Mutex::new(HashMap::new()),
++            stop: AtomicBool::new(false),
++        });
++        inner.emit(ShareEvent::Lobby(address));
++        let service = std::thread::Builder::new()
++            .name("horizon-steam-share".into())
++            .spawn({
++                let inner = inner.clone();
++                move || serve(inner, steam)
++            })
++            .map_err(|e| format!("Steam sharing's thread could not start: {e}"))?;
++        Ok(Self {
++            inner,
++            events,
++            threads: Mutex::new(vec![service]),
++        })
++    }
++
++    pub fn state(&self) -> ShareState {
++        self.inner.state.lock().unwrap().clone()
++    }
++    pub fn poll(&self) -> Vec<ShareEvent> {
++        self.events.try_iter().collect()
++    }
++    /// The guests being carried over Steam.
++    pub fn sessions(&self) -> usize {
++        self.inner.guests.lock().unwrap().len()
++    }
++    /// Open the Steam overlay's invite dialog for the lobby.
++    pub fn invite_friends(&self) -> Result<(), String> {
++        let lobby = self
++            .inner
++            .lobby
++            .lock()
++            .unwrap()
++            .ok_or_else(|| "The Steam lobby is gone".to_owned())?;
++        invite_friends_overlay(lobby);
++        Ok(())
++    }
++    /// End the share: leave the lobby, close the listener. Sessions already
++    /// playing go on until the integrated server closes them, as Play with
++    /// Friends' stop does.
++    pub fn stop(&self) {
++        self.inner.stop.store(true, Ordering::Relaxed);
++        // Dropping the listen socket rejects new connections at once.
++        *self.inner.listen.lock().unwrap() = None;
++        if let Some(lobby) = self.inner.lobby.lock().unwrap().take()
++            && let Ok(steam) = crate::acquire()
++        {
++            steam.client().matchmaking().leave_lobby(lobby);
++        }
++        for t in self.threads.lock().unwrap().drain(..) {
++            let _ = t.join();
++        }
++    }
++}
++
++/// The service loop: accept the lobby's friends, hand each connected guest
++/// to its bridge, stop when the share does.
++fn serve(inner: Arc<Inner>, steam: Arc<crate::Steam>) {
++    while !inner.stop.load(Ordering::Relaxed) {
++        let event = inner
++            .listen
++            .lock()
++            .unwrap()
++            .as_ref()
++            .and_then(|l| l.try_receive_event());
++        match event {
++            Some(ListenSocketEvent::Connecting(request)) => {
++                let remote = request.remote().steam_id();
++                if remote.is_some_and(|id| inner.admitted(&steam, id)) {
++                    // Failures surface through Disconnected.
++                    let _ = request.accept();
++                } else {
++                    let _ = request.reject(
++                        NetConnectionEnd::App(AppNetConnectionEnd::generic_normal()),
++                        Some("Horizon: the world is full, or you were not invited"),
++                    );
++                    if remote.is_some() {
++                        log::info!("Steam share: refused a guest who has no seat in the lobby");
++                    }
++                }
++            }
++            Some(ListenSocketEvent::Connected(connected)) => {
++                if let Some(id) = connected.remote().steam_id() {
++                    let raw = id.raw();
++                    let mut guests = inner.guests.lock().unwrap();
++                    if guests.len() < MAX_GUESTS && guests.insert(raw, ()).is_none() {
++                        drop(guests);
++                        spawn_bridge(&inner, raw, connected.take_connection());
++                        inner.emit(ShareEvent::GuestJoined { steam_id: raw });
++                    }
++                }
++            }
++            _ => {}
++        }
++        std::thread::sleep(Duration::from_millis(10));
++    }
++}
++
++/// One guest: check its opening (its first bytes prove it logs in as its
++/// Steam account), then carry the stream between Steam and the integrated
++/// server until either side ends it.
++fn spawn_bridge(inner: &Arc<Inner>, steam_id: u64, conn: NetConnection) {
++    let inner = inner.clone();
++    let started = std::thread::Builder::new()
++        .name("horizon-steam-guest".into())
++        .spawn(move || bridge(inner, steam_id, conn));
++    if let Err(e) = started {
++        log::warn!("Steam share: a guest's bridge could not start: {e}");
++    }
++}
++
++/// How long a guest has to send a proper opening.
++const OPENING: Duration = Duration::from_secs(10);
++/// How much of the game's stream goes in one Steam message (e4steam's
++/// DATA_CHUNK_SIZE).
++const CHUNK: usize = 32 * 1024;
++
++fn bridge(inner: Arc<Inner>, steam_id: u64, mut conn: NetConnection) {
++    let end = |reason: &str| {
++        log::info!("Steam share: guest {steam_id}: {reason}");
++        let mut guests = inner.guests.lock().unwrap();
++        if guests.remove(&steam_id).is_some() {
++            inner.emit(ShareEvent::GuestLeft { steam_id });
++        }
++    };
++    // The opening: the handshake and the login's Hello, straight from the
++    // guest's first messages.
++    let mut opening = Opening::default();
++    let mut front: Vec<u8> = Vec::new();
++    let mut fed = 0usize;
++    let deadline = Instant::now() + OPENING;
++    let verdict = loop {
++        match opening.feed(&front[fed..]) {
++            Ok(verdict) => break Some(verdict),
++            Err(true) => {}
++            Err(false) => break None,
++        }
++        fed = front.len();
++        if let Some(messages) = receive(&mut conn) {
++            for message in messages {
++                front.extend_from_slice(message.data());
++            }
++        }
++        if let Some(steamworks::networking_types::NetConnectionEvent {
++            new_state:
++                NetworkingConnectionState::ClosedByPeer
++                | NetworkingConnectionState::ProblemDetectedLocally,
++            ..
++        }) = conn.try_receive_event()
++        {
++            end("hung up before logging in");
++            return;
++        }
++        if Instant::now() > deadline {
++            end("never finished logging in");
++            return;
++        }
++        std::thread::sleep(Duration::from_millis(5));
++    };
++    match verdict {
++        Some(guard::Verdict::Allowed(name)) if name == identity::safe_name(steam_id) => {}
++        other => {
++            let reason = match other {
++                Some(guard::Verdict::Refused(reason)) => reason,
++                Some(_) => "logged in under another name than its Steam account",
++                None => "sent an opening Horizon doesn't understand",
++            };
++            let _ = conn.close(
++                NetConnectionEnd::App(AppNetConnectionEnd::generic_normal()),
++                Some("Horizon: log in with the name of your Steam account"),
++                false,
++            );
++            end(reason);
++            return;
++        }
++    }
++    let Ok(mut server) = TcpStream::connect_timeout(&inner.config.lan, Duration::from_secs(5))
++    else {
++        let _ = conn.close(
++            NetConnectionEnd::App(AppNetConnectionEnd::generic_exception()),
++            Some("Horizon: the world's server isn't reachable"),
++            false,
++        );
++        end("the integrated server didn't answer");
++        return;
++    };
++    let _ = server.set_nodelay(true);
++    inner
++        .state
++        .lock()
++        .unwrap()
++        .guests
++        .push(identity::safe_name(steam_id));
++    inner.emit(ShareEvent::GuestJoined { steam_id });
++    // The bytes read before the verdict were the guest's opening: the server
++    // still needs them.
++    if server.write_all(&front).is_err() {
++        end("the integrated server closed the connection");
++        return;
++    }
++    carry(&mut conn, &mut server);
++    let _ = server.shutdown(Shutdown::Both);
++    let name = identity::safe_name(steam_id);
++    inner.state.lock().unwrap().guests.retain(|g| *g != name);
++    end("the session ended");
++}
++
++/// The pump: Steam messages to the server, the server's bytes to Steam,
++/// until either side ends the session. One thread per guest; the game's
++/// traffic is modest, so a short poll keeps latency low without blocking
++/// reads on either side.
++fn carry(conn: &mut NetConnection, server: &mut TcpStream) {
++    let _ = server.set_nonblocking(true);
++    let mut buf = vec![0u8; CHUNK];
++    loop {
++        let mut idle = true;
++        if let Some(messages) = receive(conn) {
++            for message in messages {
++                if server.write_all(message.data()).is_err() {
++                    return;
++                }
++                idle = false;
++            }
++        }
++        if let Some(event) = conn.try_receive_event()
++            && matches!(
++                event.new_state,
++                NetworkingConnectionState::ClosedByPeer
++                    | NetworkingConnectionState::ProblemDetectedLocally
++                    | NetworkingConnectionState::None
++            )
++        {
++            return;
++        }
++        match server.read(&mut buf) {
++            Ok(0) => return,
++            Ok(n) => {
++                let Ok(_) = conn.send_message(
++                    &buf[..n],
++                    steamworks::networking_types::SendFlags::RELIABLE
++                        | steamworks::networking_types::SendFlags::NO_NAGLE,
++                ) else {
++                    return;
++                };
++                idle = false;
++            }
++            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
++            Err(_) => return,
++        }
++        if idle {
++            std::thread::sleep(Duration::from_millis(1));
++        }
++    }
++}
++
++/// The connection's queued messages, or None when its handle is gone.
++fn receive(conn: &mut NetConnection) -> Option<Vec<NetworkingMessage>> {
++    conn.receive_messages(64).ok()
++}
++
++/// The Steam overlay's invite dialog for a lobby: the player picks friends
++/// and Steam sends the invitations, as e4steam's "Invite friends" does.
++pub(crate) fn invite_friends_overlay(lobby: LobbyId) {
++    // steamworks has no wrapper for this one; the flat C API takes the
++    // friends interface and the lobby's id.
++    unsafe {
++        let friends = steamworks::sys::SteamAPI_SteamFriends_v018();
++        steamworks::sys::SteamAPI_ISteamFriends_ActivateGameOverlayInviteDialog(
++            friends,
++            lobby.raw(),
++        );
++    }
++}
+-- 
+2.55.0.windows.5
+
+
+From cf4e2cea1c972450dc90501b5b9f8d0a69068180 Mon Sep 17 00:00:00 2001
+From: sambukuper <sambukuper@users.noreply.github.com>
+Date: Thu, 29 Oct 2026 22:03:22 +0300
+Subject: [PATCH 2/3] Open the world to Steam friends from Play with Friends
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The screen's Steam section (there when Steam is signed in) offers Open to
+Steam Friends and Invitation Only, Copy Address, Invite Friends through
+the overlay's invite dialog, and Stop. Starting it opens the world to LAN
+as invite-code sharing does, and the two shares hand the LAN port over to
+each other instead of closing it under the other's guests. Guests join
+from a Steam invitation (accepting one at the title screen joins the
+lobby the callback names) or the world's steam:<lobby id> address —
+Direct Connection takes a bare lobby id too — and log in under their own
+Steam account's safe name, which the host's check expects. Without the
+client's `steam` feature nothing is offered and nothing links: the
+section is absent and steam: addresses report that the build lacks it.
+
+Co-Authored-By: ZCode (GLM-5.3-Flash) <noreply@z.ai>
+---
+ crates/horizon-client/Cargo.toml              |   8 +
+ crates/horizon-client/src/friends_screen.rs   | 100 +++++++++
+ crates/horizon-client/src/game.rs             |   6 +
+ crates/horizon-client/src/game/friends.rs     | 164 ++++++++++++++-
+ crates/horizon-client/src/game/remote.rs      |  22 ++
+ .../horizon-client/src/game/steam_friends.rs  | 198 ++++++++++++++++++
+ crates/horizon-client/src/multiplayer.rs      |  13 +-
+ crates/horizon-client/src/net.rs              |  62 ++++--
+ 8 files changed, 555 insertions(+), 18 deletions(-)
+ create mode 100644 crates/horizon-client/src/game/steam_friends.rs
+
+diff --git a/crates/horizon-client/Cargo.toml b/crates/horizon-client/Cargo.toml
+index 74c593bc6..ef7c35c94 100644
+--- a/crates/horizon-client/Cargo.toml
++++ b/crates/horizon-client/Cargo.toml
+@@ -26,6 +26,10 @@ horizon-shaders = { path = "../horizon-shaders" }
+ # Horizon's own shader packs: the format, the stages and the check (docs/shaders.md).
+ horizon-shader-api = { path = "../horizon-shader-api" }
+ horizon-friends = { path = "../horizon-friends" }
++# Steam sharing: e4steam's Steam P2P multiplayer, ported (docs/steam-friends.md).
++# The `steam` feature links the Steamworks SDK redistributable, so the game
++# needs steam_api beside it; off in dev builds and tests.
++horizon-steam = { path = "../horizon-steam", optional = true }
+ # Horizon mods: sandboxed WebAssembly components, off unless installed and turned on (docs/mods.md).
+ # Their runtime is the `mods` feature.
+ horizon-mods = { path = "../horizon-mods", default-features = false, features = ["index"] }
+@@ -94,6 +98,10 @@ controllers = ["dep:gilrs", "dep:horizon-dualsense", "horizon-client-input/contr
+ # Runs code mods (wasmtime and cranelift: a quarter of a clean build). On in every release build
+ # (release.yml); the tests and probes don't need it. Content mods load without it.
+ mods = ["horizon-mods/runtime"]
++# Steam sharing (Play with Friends's Steam section, `steam:` joins, the e4steam
++# port). On in every release build next to `mods`; release packaging copies the
++# Steamworks redistributable beside the game (docs/steam-friends.md).
++steam = ["dep:horizon-steam"]
+ # Records the call sites of mob random draws (`mob_ai_probe` traces).
+ rng-trace = ["horizon-core/rng-trace"]
+ 
+diff --git a/crates/horizon-client/src/friends_screen.rs b/crates/horizon-client/src/friends_screen.rs
+index 7577e2add..c12a7cbb7 100644
+--- a/crates/horizon-client/src/friends_screen.rs
++++ b/crates/horizon-client/src/friends_screen.rs
+@@ -30,6 +30,21 @@ pub struct FriendsView {
+     pub notice: Option<String>,
+     /// The code was just copied.
+     pub copied: bool,
++    /// The Steam section (the e4steam port), when Steam sharing is offered.
++    pub steam: Option<SteamView>,
++}
++
++/// The Steam part of the screen: the world open to a Steam lobby, joined
++/// through Steam itself with no port forwarding.
++#[derive(Clone, Debug, Default)]
++pub struct SteamView {
++    pub sharing: bool,
++    /// The world's Steam address (`steam:<lobby id>`).
++    pub address: Option<String>,
++    /// Why Steam sharing isn't serving, when the player asked for it.
++    pub problem: Option<String>,
++    /// The address was just copied.
++    pub copied: bool,
+ }
+ 
+ /// A button's action.
+@@ -38,6 +53,16 @@ pub enum Action {
+     Share,
+     Copy,
+     Stop,
++    /// Open the world to Steam friends (any of them).
++    SteamFriends,
++    /// Open the world to invited Steam friends only.
++    SteamInvitation,
++    /// Copy the Steam address.
++    SteamCopy,
++    /// Close the Steam share.
++    SteamStop,
++    /// Open the Steam overlay's invite dialog.
++    SteamInvite,
+     /// Open the troubleshooting page.
+     Help,
+     Done,
+@@ -143,6 +168,81 @@ fn layout(
+             active: view.shown,
+         });
+     }
++    // The Steam section (the e4steam port), when Steam is signed in and it
++    // fits above the footer.
++    if let Some(steam) = &view.steam
++        && y + 70.0 <= h - 33.0
++    {
++        y += 6.0;
++        lines.push(("Steam".to_owned(), grey(), y));
++        y += 12.0;
++        if steam.sharing {
++            match &steam.address {
++                Some(address) => add(
++                    &mut lines,
++                    &format!("Friends join from a Steam invite, or the address {address}."),
++                    WHITE,
++                    &mut y,
++                ),
++                None => add(&mut lines, "Opening the Steam lobby...", WHITE, &mut y),
++            }
++            buttons.push(Button {
++                x: cx - 154.0,
++                y,
++                w: 100.0,
++                label: if steam.copied {
++                    "Copied"
++                } else {
++                    "Copy Address"
++                },
++                action: Action::SteamCopy,
++                active: steam.address.is_some(),
++            });
++            buttons.push(Button {
++                x: cx - 50.0,
++                y,
++                w: 100.0,
++                label: "Invite Friends...",
++                action: Action::SteamInvite,
++                active: true,
++            });
++            buttons.push(Button {
++                x: cx + 54.0,
++                y,
++                w: 100.0,
++                label: "Stop",
++                action: Action::SteamStop,
++                active: true,
++            });
++            y += 30.0;
++            if let Some(problem) = &steam.problem {
++                add(&mut lines, problem, WHITE, &mut y);
++            }
++        } else {
++            add(
++                &mut lines,
++                "Steam friends join with no port forwarding and no code: the world opens to a Steam lobby, and the game travels through Steam itself.",
++                WHITE,
++                &mut y,
++            );
++            buttons.push(Button {
++                x: cx - 154.0,
++                y,
++                w: 150.0,
++                label: "Open to Steam Friends",
++                action: Action::SteamFriends,
++                active: view.shown,
++            });
++            buttons.push(Button {
++                x: cx + 4.0,
++                y,
++                w: 150.0,
++                label: "Invitation Only",
++                action: Action::SteamInvitation,
++                active: view.shown,
++            });
++        }
++    }
+     // HeaderAndFooterLayout's footer: Done, beside Troubleshooting when
+     // friends on the internet can't reach the host.
+     if view.sharing && view.help.is_some() {
+diff --git a/crates/horizon-client/src/game.rs b/crates/horizon-client/src/game.rs
+index 1d7bbbbd6..eb06cbec1 100644
+--- a/crates/horizon-client/src/game.rs
++++ b/crates/horizon-client/src/game.rs
+@@ -184,6 +184,7 @@ mod station_control;
+ mod stations;
+ mod stats;
+ mod stats_screen;
++mod steam_friends;
+ mod storage;
+ mod structures;
+ mod subtitle_hud;
+@@ -1846,6 +1847,9 @@ struct Game<'a> {
+     serving: Option<integrated::Serving>,
+     /// The open world is shared behind an invite code (game/friends.rs).
+     friends: Option<friends::Sharing>,
++    /// The open world is open to Steam friends (game/friends.rs, the e4steam
++    /// port over horizon-steam).
++    steam: Option<friends::SteamSharing>,
+     world_options: Option<lan_screen::WorldOptions>,
+     /// Chat Settings opened from RestrictionsScreen: Done returns to World Options.
+     options_to_world_options: bool,
+@@ -5481,6 +5485,7 @@ impl Game<'_> {
+         }
+         horizon_client::spans::time("tick_lan", || self.tick_lan(false));
+         self.tick_friends();
++        self.tick_steam();
+         horizon_client::spans::time("tick_hand", || self.tick_hand());
+         horizon_client::spans::time("tick_sleep", || self.tick_sleep());
+         self.announce_sleep_status();
+@@ -13941,6 +13946,7 @@ impl<'a> Game<'a> {
+             options_to_world_options: false,
+             command_block_screen: None,
+             friends: None,
++            steam: None,
+             debug_keys: Default::default(),
+             debug_charts: Default::default(),
+             show_hitboxes: false,
+diff --git a/crates/horizon-client/src/game/friends.rs b/crates/horizon-client/src/game/friends.rs
+index b6d1ad660..02b14f40c 100644
+--- a/crates/horizon-client/src/game/friends.rs
++++ b/crates/horizon-client/src/game/friends.rs
+@@ -6,7 +6,7 @@
+ //! configured adds a short code and a fallback. The integrated server is the
+ //! LAN one, unchanged: tunnelled guests are LAN guests that connect from the
+ //! loopback address.
+-use super::{Game, lan::LanSettings};
++use super::{Game, lan::LanSettings, steam_friends};
+ use horizon_client::{
+     Result,
+     friends_screen::{self, Action, FriendsView},
+@@ -30,6 +30,14 @@ pub(super) struct Sharing {
+     paths: (u32, u32),
+ }
+ 
++/// Steam sharing (the e4steam port): the Steam share and whether it opened
++/// the world to LAN.
++pub(super) struct SteamSharing {
++    inner: steam_friends::Sharing,
++    /// Sharing opened the world to LAN, so stopping closes it again.
++    opened_lan: bool,
++}
++
+ pub const HELP: &[&str] = &[
+     "friends host                   share the open world behind an invite code",
+     "friends stop                   stop sharing",
+@@ -112,24 +120,132 @@ impl Game<'_> {
+     }
+ 
+     /// Stop sharing: the code ends (direct port closed, router mapping
+-    /// deleted); the world closes to LAN again if sharing opened it.
++    /// deleted); the world closes to LAN again if sharing opened it and
++    /// Steam sharing isn't using it.
+     pub(super) fn friends_stop(&mut self) {
+         let Some(mut sharing) = self.friends.take() else {
+             return;
+         };
+         sharing.host.stop();
+-        if sharing.opened_lan {
++        if sharing.opened_lan && self.steam.is_none() {
+             self.lan_close(true);
+         } else {
+             self.system_message(Text::literal("Stopped sharing the invite code."));
+         }
+     }
+ 
+-    /// The LAN server is closing: the code goes with it.
++    /// The LAN server is closing: the code and the Steam share go with it.
+     pub(super) fn friends_lan_closed(&mut self) {
+         if let Some(mut sharing) = self.friends.take() {
+             sharing.host.stop();
+         }
++        if let Some(mut sharing) = self.steam.take() {
++            sharing.inner.stop();
++        }
++    }
++
++    /// Open the world to Steam friends (the e4steam port): like
++    /// `friends_start`, it opens the world to LAN if it isn't, then shares
++    /// that port through a Steam lobby and Steam's P2P networking.
++    pub(super) fn steam_start(&mut self, access: steam_friends::Access) -> Result<()> {
++        if self.steam.is_some() {
++            return Ok(());
++        }
++        if self.title.is_some() || (self.remote.is_some() && self.integrated.is_none()) {
++            return Err("open a singleplayer world first".into());
++        }
++        let opened_lan = self.lan_port().is_none() && self.friends.is_none();
++        if self.lan_port().is_none() {
++            self.lan_open(LanSettings {
++                port: horizon_client::lan::available_port(),
++                guest_commands: false,
++                force_game_mode: true,
++            })?;
++        }
++        let port = self.lan_port().ok_or("the world isn't open to LAN")?;
++        match steam_friends::Sharing::start(
++            std::net::SocketAddr::from(([127, 0, 0, 1], port)),
++            access,
++        ) {
++            Ok(inner) => {
++                self.steam = Some(SteamSharing { inner, opened_lan });
++                Ok(())
++            }
++            Err(e) => {
++                if opened_lan {
++                    self.lan_close(true);
++                }
++                Err(e.into())
++            }
++        }
++    }
++
++    /// Stop sharing to Steam friends: the lobby closes. Sessions already
++    /// playing go on until the integrated server closes them.
++    pub(super) fn steam_stop(&mut self) {
++        let Some(mut sharing) = self.steam.take() else {
++            return;
++        };
++        sharing.inner.stop();
++        if sharing.opened_lan && self.friends.is_none() {
++            self.lan_close(true);
++        } else {
++            self.system_message(Text::literal("Stopped sharing to Steam friends."));
++        }
++    }
++
++    /// Steam's news, once a tick: guests arriving and leaving, and invites
++    /// the player accepted in the overlay.
++    pub(super) fn tick_steam(&mut self) {
++        if let Some(address) = steam_friends::Sharing::take_invite() {
++            if self.title.is_some() && self.remote.is_none() {
++                if let Err(e) = self.connect_server(&address, &self.options.player_name()) {
++                    self.system_message(Text::literal(format!(
++                        "Couldn't join your friend's Steam world: {e}"
++                    )));
++                }
++            } else {
++                self.system_message(Text::literal(format!(
++                    "A Steam invite arrived: leave to the title screen, then accept it again to join {address}."
++                )));
++            }
++        }
++        let Some(sharing) = self.steam.as_mut() else {
++            return;
++        };
++        for event in sharing.inner.tick() {
++            match event {
++                steam_friends::Event::GuestJoined => {
++                    self.system_message(Text::literal("A friend joined over Steam."))
++                }
++                steam_friends::Event::GuestLeft => {
++                    self.system_message(Text::literal("Your friend left."))
++                }
++            }
++        }
++    }
++
++    /// Copy the Steam address for a friend to paste.
++    pub(super) fn steam_copy(&mut self) {
++        let Some(address) = self.steam.as_ref().and_then(|s| s.inner.address()) else {
++            return;
++        };
++        use horizon_client::clipboard::Clipboard;
++        self.clipboard.set(&address);
++        if let Some(s) = self.steam.as_mut() {
++            s.inner.mark_copied();
++        }
++    }
++
++    /// Open the Steam overlay's invite dialog.
++    pub(super) fn steam_invite(&mut self) {
++        if let Some(s) = self.steam.as_mut()
++            && let Err(e) = s.inner.invite()
++        {
++            self.system_message(Text::literal(format!(
++                "Couldn't open the Steam invite dialog: {e}"
++            )));
++        }
+     }
+ 
+     /// New codes and sessions, once a tick and while the pause menu is drawn.
+@@ -200,6 +316,19 @@ impl Game<'_> {
+             }
+             Action::Copy => self.friends_copy(),
+             Action::Stop => self.friends_stop(),
++            Action::SteamFriends => {
++                if let Err(e) = self.steam_start(steam_friends::Access::Friends) {
++                    self.system_message(Text::literal(format!("Couldn't share the world: {e}")));
++                }
++            }
++            Action::SteamInvitation => {
++                if let Err(e) = self.steam_start(steam_friends::Access::Invitation) {
++                    self.system_message(Text::literal(format!("Couldn't share the world: {e}")));
++                }
++            }
++            Action::SteamCopy => self.steam_copy(),
++            Action::SteamStop => self.steam_stop(),
++            Action::SteamInvite => self.steam_invite(),
+             // The system browser, as the folder buttons open their folders.
+             Action::Help => {
+                 if let Some(url) = &view.help {
+@@ -223,9 +352,11 @@ impl Game<'_> {
+             }
+             None => Vec::new(),
+         };
++        let steam = self.steam_view();
+         let Some(s) = &self.friends else {
+             return FriendsView {
+                 shown: self.remote.is_none() || self.integrated.is_some(),
++                steam,
+                 ..FriendsView::default()
+             };
+         };
+@@ -258,9 +389,29 @@ impl Game<'_> {
+             copied: s
+                 .copied
+                 .is_some_and(|t| t.elapsed() < Duration::from_secs(2)),
++            steam,
+         }
+     }
+ 
++    /// The Steam section of the view, when Steam sharing is offered.
++    fn steam_view(&self) -> Option<friends_screen::SteamView> {
++        (steam_friends::Sharing::available() || self.steam.is_some()).then(|| {
++            let (sharing, address, problem) = match &self.steam {
++                Some(s) => {
++                    let v = s.inner.view();
++                    (v.sharing, v.address, v.problem)
++                }
++                None => (false, None, None),
++            };
++            friends_screen::SteamView {
++                sharing,
++                address,
++                problem,
++                copied: self.steam.as_ref().is_some_and(|s| s.inner.just_copied()),
++            }
++        })
++    }
++
+     /// `horizon-ctl friends ...`.
+     pub(super) fn friends_control(&mut self, words: &[&str]) -> Result<Option<serde_json::Value>> {
+         use serde_json::json;
+@@ -293,6 +444,11 @@ impl Game<'_> {
+                     "relayed": self.friends.as_ref().map_or(0, |s| s.paths.1),
+                     "guests": view.guests,
+                     "lan_port": self.lan_port(),
++                    "steam": view.steam.map(|s| json!({
++                        "sharing": s.sharing,
++                        "address": s.address,
++                        "problem": s.problem,
++                    })),
+                 })))
+             }
+             _ => Err("friends host|stop|status".into()),
+diff --git a/crates/horizon-client/src/game/remote.rs b/crates/horizon-client/src/game/remote.rs
+index 4c8627026..45738b8ca 100644
+--- a/crates/horizon-client/src/game/remote.rs
++++ b/crates/horizon-client/src/game/remote.rs
+@@ -357,6 +357,16 @@ impl Game<'_> {
+         // A signed-in account always plays under its own name.
+         let auth = horizon_client::auth::current();
+         let name = auth.as_ref().map_or(name, |a| a.name.as_str());
++        // A Steam join plays under the name of its Steam account
++        // (horizon-steam): the host's Steam check refuses anything else.
++        #[cfg(feature = "steam")]
++        let steam_name: Option<String> = address
++            .starts_with(horizon_client::net::STEAM)
++            .then(horizon_steam::own_steam_id)
++            .flatten()
++            .map(horizon_steam::identity::safe_name);
++        #[cfg(feature = "steam")]
++        let name: &str = steam_name.as_deref().unwrap_or(name);
+         let user = auth.as_ref().map_or_else(
+             || {
+                 (
+@@ -366,6 +376,18 @@ impl Game<'_> {
+             },
+             |a| (a.name.clone(), a.uuid),
+         );
++        // A Steam join's identity is its Steam account, not the account's.
++        #[cfg(feature = "steam")]
++        let user = if address.starts_with(horizon_client::net::STEAM)
++            && let Some(id) = horizon_steam::own_steam_id()
++        {
++            (
++                horizon_steam::identity::safe_name(id),
++                horizon_steam::identity::uuid(id),
++            )
++        } else {
++            user
++        };
+         self.server_packs_connect(local.is_none().then_some(address), user);
+         let session = match local {
+             Some(pipe) => Session::connect_local(pipe, name, view, lang.clone()),
+diff --git a/crates/horizon-client/src/game/steam_friends.rs b/crates/horizon-client/src/game/steam_friends.rs
+new file mode 100644
+index 000000000..be0d765a1
+--- /dev/null
++++ b/crates/horizon-client/src/game/steam_friends.rs
+@@ -0,0 +1,198 @@
++//! Steam sharing: the e4steam port ([horizon-steam]) behind the Play with
++//! Friends screen. The host's world opens to a Steam lobby (friends join
++//! freely, or only by invitation) and guests' streams travel over Steam's
++//! P2P networking to the integrated server's LAN port. Without the client's
++//! `steam` feature every type is here with the same shape, but nothing is
++//! offered: `available` is false, `start` refuses, invites never arrive.
++//!
++//! [horizon-steam]: ../../../horizon_steam/index.html
++
++/// Who may join, as the Play with Friends screen offers it.
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub enum Access {
++    /// Steam friends join freely (e4steam's "Steam friends").
++    Friends,
++    /// Joining needs an invitation the host sends in the Steam overlay.
++    Invitation,
++}
++
++/// What the Play with Friends screen shows about Steam sharing.
++#[derive(Clone, Debug, Default)]
++#[cfg_attr(not(feature = "steam"), allow(dead_code))]
++pub struct View {
++    /// The world is open to Steam friends right now.
++    pub sharing: bool,
++    /// The world's Steam address (`steam:<lobby id>`).
++    pub address: Option<String>,
++    /// Why Steam sharing isn't serving, when the player asked for it.
++    pub problem: Option<String>,
++}
++
++/// What a tick reports to the game.
++#[derive(Debug)]
++#[cfg_attr(not(feature = "steam"), allow(dead_code))]
++pub enum Event {
++    /// A friend's session is being carried over Steam.
++    GuestJoined,
++    /// The friend's session ended.
++    GuestLeft,
++}
++
++#[cfg(feature = "steam")]
++mod imp {
++    use super::{Access, Event, View};
++    use horizon_protocol::{GAME_VERSION, PROTOCOL_VERSION};
++    use std::time::Instant;
++
++    pub struct Sharing {
++        share: Option<horizon_steam::share::Share>,
++        copied: Option<Instant>,
++    }
++
++    impl Sharing {
++        /// Whether Steam sharing can be offered (Steam is running).
++        pub fn available() -> bool {
++            horizon_steam::available()
++        }
++
++        /// Start sharing the world already open to LAN on `lan`.
++        pub fn start(lan: std::net::SocketAddr, access: Access) -> Result<Sharing, String> {
++            let share = horizon_steam::share::Share::start(horizon_steam::share::ShareConfig {
++                lan,
++                protocol: PROTOCOL_VERSION,
++                game: GAME_VERSION.to_owned(),
++                access: match access {
++                    Access::Friends => horizon_steam::share::Access::Friends,
++                    Access::Invitation => horizon_steam::share::Access::Invitation,
++                },
++            })?;
++            Ok(Sharing {
++                share: Some(share),
++                copied: None,
++            })
++        }
++
++        /// End the share: the lobby closes; sessions already playing go on.
++        pub fn stop(&mut self) {
++            if let Some(share) = self.share.take() {
++                share.stop();
++            }
++        }
++
++        /// New sessions and Steam's news, once a tick.
++        pub fn tick(&mut self) -> Vec<Event> {
++            let Some(share) = &self.share else {
++                return Vec::new();
++            };
++            share
++                .poll()
++                .into_iter()
++                .filter_map(|event| match event {
++                    horizon_steam::share::ShareEvent::GuestJoined { .. } => {
++                        Some(Event::GuestJoined)
++                    }
++                    horizon_steam::share::ShareEvent::GuestLeft { .. } => Some(Event::GuestLeft),
++                    horizon_steam::share::ShareEvent::Lobby(_) => None,
++                })
++                .collect()
++        }
++
++        /// What the screen shows.
++        pub fn view(&self) -> View {
++            match &self.share {
++                Some(share) => {
++                    let state = share.state();
++                    View {
++                        sharing: true,
++                        address: state.address,
++                        problem: state.problem,
++                    }
++                }
++                None => View::default(),
++            }
++        }
++
++        /// The Steam address, for the copy button.
++        pub fn address(&self) -> Option<String> {
++            self.view().address
++        }
++
++        /// The address was just copied (the button says so for a moment).
++        pub fn mark_copied(&mut self) {
++            self.copied = Some(Instant::now());
++        }
++        pub fn just_copied(&self) -> bool {
++            self.copied
++                .is_some_and(|t| t.elapsed() < std::time::Duration::from_secs(2))
++        }
++
++        /// Open the Steam overlay's invite dialog.
++        pub fn invite(&mut self) -> Result<(), String> {
++            match &self.share {
++                Some(share) => share.invite_friends(),
++                None => Err("Steam sharing isn't on".into()),
++            }
++        }
++
++        /// A Steam invite the player accepted in the overlay: the address to
++        /// join, or None. Polled by the game, so a friend's invite arrives
++        /// whether or not this game is sharing.
++        pub fn take_invite() -> Option<String> {
++            static RX: std::sync::OnceLock<
++                Option<std::sync::Mutex<std::sync::mpsc::Receiver<horizon_steam::SteamEvent>>>,
++            > = std::sync::OnceLock::new();
++            let rx = RX
++                .get_or_init(|| horizon_steam::subscribe().ok().map(std::sync::Mutex::new))
++                .as_ref()?;
++            loop {
++                match rx.lock().unwrap().try_recv() {
++                    Ok(horizon_steam::SteamEvent::JoinRequested { lobby }) => {
++                        return Some(horizon_steam::lobby_address(lobby));
++                    }
++                    // Lobby membership changes matter to nobody here.
++                    Ok(_) => {}
++                    Err(_) => return None,
++                }
++            }
++        }
++    }
++}
++
++#[cfg(not(feature = "steam"))]
++mod imp {
++    use super::{Access, Event, View};
++    use std::net::SocketAddr;
++
++    pub struct Sharing;
++
++    impl Sharing {
++        pub fn available() -> bool {
++            false
++        }
++        pub fn start(_lan: SocketAddr, _access: Access) -> Result<Sharing, String> {
++            Err("This build doesn't have Steam sharing.".into())
++        }
++        pub fn stop(&mut self) {}
++        pub fn tick(&mut self) -> Vec<Event> {
++            Vec::new()
++        }
++        pub fn view(&self) -> View {
++            View::default()
++        }
++        pub fn address(&self) -> Option<String> {
++            None
++        }
++        pub fn mark_copied(&mut self) {}
++        pub fn just_copied(&self) -> bool {
++            false
++        }
++        pub fn invite(&mut self) -> Result<(), String> {
++            Err("This build doesn't have Steam sharing.".into())
++        }
++        pub fn take_invite() -> Option<String> {
++            None
++        }
++    }
++}
++
++pub use imp::Sharing;
+diff --git a/crates/horizon-client/src/multiplayer.rs b/crates/horizon-client/src/multiplayer.rs
+index 39ea26502..22bb8d0d6 100644
+--- a/crates/horizon-client/src/multiplayer.rs
++++ b/crates/horizon-client/src/multiplayer.rs
+@@ -1371,7 +1371,8 @@ impl Screen {
+ }
+ 
+ /// Direct Connection's address; a full invite code pasted there joins the
+-/// friend (a short relay code could be a host name, so it needs Join a Friend).
++/// friend (a short relay code could be a host name, so it needs Join a Friend),
++/// and a bare Steam lobby id joins the friend's Steam world.
+ fn direct_address(address: &str) -> String {
+     let code: String = address.chars().filter(|c| !c.is_whitespace()).collect();
+     if matches!(
+@@ -1379,6 +1380,8 @@ fn direct_address(address: &str) -> String {
+         Some(horizon_friends::invite::Parsed::Long(_))
+     ) {
+         format!("{}{code}", crate::net::FRIEND)
++    } else if !code.is_empty() && code.chars().all(|c| c.is_ascii_digit()) {
++        format!("{}{code}", crate::net::STEAM)
+     } else {
+         address.trim().to_owned()
+     }
+@@ -1423,6 +1426,14 @@ mod tests {
+             direct_address(&format!(" {invite} ")),
+             format!("{}{invite}", crate::net::FRIEND)
+         );
++        assert_eq!(
++            direct_address(" 109775241234567890 "),
++            format!("{}109775241234567890", crate::net::STEAM)
++        );
++        assert_eq!(
++            direct_address("steam:109775241234567890"),
++            "steam:109775241234567890"
++        );
+         for host in ["localhost", "example.org:25566", "abcdefgh", "[::1]:25568"] {
+             assert_eq!(direct_address(host), host);
+         }
+diff --git a/crates/horizon-client/src/net.rs b/crates/horizon-client/src/net.rs
+index 93364ed91..6e0ab16c7 100644
+--- a/crates/horizon-client/src/net.rs
++++ b/crates/horizon-client/src/net.rs
+@@ -282,18 +282,26 @@ impl Drop for Session {
+ /// client reaches on a loopback port, so everything after is a plain join.
+ pub const FRIEND: &str = horizon_friends::ADDRESS_PREFIX;
+ 
++/// An address of the form `steam:<lobby id>` joins a friend's world through
++/// Steam (horizon-steam, the e4steam port): the same shape, a tunnel the
++/// client reaches on a loopback port.
++pub const STEAM: &str = "steam:";
++
+ /// An address as players and logs see it: a friend's invite code stays
+ /// out of it (its secret is in there).
+ pub fn shown_address(address: &str) -> String {
+-    match address.strip_prefix(FRIEND) {
+-        Some(code) => match horizon_friends::invite::parse(code) {
++    if let Some(code) = address.strip_prefix(FRIEND) {
++        return match horizon_friends::invite::parse(code) {
+             Some(horizon_friends::invite::Parsed::Short(c)) => {
+                 format!("Friend's world ({}-****)", c.nameplate)
+             }
+             _ => "Friend's world".to_owned(),
+-        },
+-        None => address.to_owned(),
++        };
++    }
++    if address.starts_with(STEAM) {
++        return "A friend's Steam world".to_owned();
+     }
++    address.to_owned()
+ }
+ 
+ /// The relay the player set (`friendsRelay` in horizon.txt, beside
+@@ -339,6 +347,31 @@ fn join_friend(code: &str, send: &Sender<Event>) -> Result<(String, u16), String
+     Ok(("127.0.0.1".to_owned(), port))
+ }
+ 
++/// Reach the friend's world from its `steam:<lobby id>` address: join the
++/// Steam lobby, connect over Steam's P2P networking, and open the tunnel on
++/// a loopback port (horizon-steam, the e4steam port).
++fn join_steam(lobby: &str, send: &Sender<Event>) -> Result<(String, u16), String> {
++    #[cfg(feature = "steam")]
++    {
++        use horizon_steam::guest;
++        status(send, "Finding your friend's Steam world...");
++        let tunnel = guest::join(&guest::GuestConfig {
++            lobby: lobby.to_owned(),
++            protocol: PROTOCOL_VERSION,
++            game: horizon_protocol::GAME_VERSION.to_owned(),
++        })
++        .map_err(|e| e.to_string())?;
++        status(send, "Connected to your friend through Steam...");
++        let (port, _) = tunnel.serve_loopback().map_err(|e| e.to_string())?;
++        Ok(("127.0.0.1".to_owned(), port))
++    }
++    #[cfg(not(feature = "steam"))]
++    {
++        let _ = (lobby, send);
++        Err("This build doesn't have Steam sharing.".into())
++    }
++}
++
+ fn status(send: &Sender<Event>, text: &str) {
+     let _ = send.send(Event::Status(text.to_owned()));
+ }
+@@ -372,16 +405,19 @@ fn run(
+     } else {
+         let (host, port) = match address.strip_prefix(FRIEND) {
+             Some(code) => join_friend(code, send)?,
+-            None => {
+-                let Some(target) = parse_address(address) else {
+-                    return Ok(format!("Invalid server address: {address}"));
+-                };
+-                status(send, "Connecting to the server...");
+-                target
+-            }
++            None => match address.strip_prefix(STEAM) {
++                Some(lobby) => join_steam(lobby, send)?,
++                None => {
++                    let Some(target) = parse_address(address) else {
++                        return Ok(format!("Invalid server address: {address}"));
++                    };
++                    status(send, "Connecting to the server...");
++                    target
++                }
++            },
+         };
+-        let c = if address.starts_with(FRIEND) {
+-            // The friends relay supplies a concrete endpoint, not a Minecraft hostname.
++        let c = if address.starts_with(FRIEND) || address.starts_with(STEAM) {
++            // The tunnel supplies a concrete endpoint, not a Minecraft hostname.
+             Connection::connect(&host, port, Duration::from_secs(10))
+         } else {
+             Connection::connect_server(&host, port, Duration::from_secs(10))
+-- 
+2.55.0.windows.5
+
+
+From d5001e3a1daac39585659bbde69ab55f7577daf0 Mon Sep 17 00:00:00 2001
+From: sambukuper <sambukuper@users.noreply.github.com>
+Date: Thu, 29 Oct 2026 22:03:23 +0300
+Subject: [PATCH 3/3] Document Steam sharing
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+docs/steam-friends.md: what carries over from the mod and how, playing
+host and guest, building with the feature (and the redistributable the
+game needs beside it), and the release question left open on purpose —
+the release workflow's only-system-libraries check refuses a statically
+imported steam_api, so enabling the feature in releases takes one of the
+three routes the page lays out. Indexed from docs/README.md and linked
+from docs/play-with-friends.md.
+
+Co-Authored-By: ZCode (GLM-5.3-Flash) <noreply@z.ai>
+---
+ docs/README.md            |   1 +
+ docs/play-with-friends.md |   3 +
+ docs/steam-friends.md     | 115 ++++++++++++++++++++++++++++++++++++++
+ 3 files changed, 119 insertions(+)
+ create mode 100644 docs/steam-friends.md
+
+diff --git a/docs/README.md b/docs/README.md
+index 1f2d2fefa..8cc574698 100644
+--- a/docs/README.md
++++ b/docs/README.md
+@@ -23,6 +23,7 @@ To play, use [the launcher](../launcher/README.md); the project site is [playhor
+ - [Benchmark report format](benchmark-report.md): the versioned JSON every benchmark writes (game, launcher, `tools/perf_bench.py`), the local log and, with consent, the upload.
+ - [Horizon APIs](api/README.md): every surface other programs build on (mods, shaders, agent control, servers, the launcher, data formats), each with its guide, generated reference, stability and changelog, and the [stability and versioning policy](api/stability.md).
+ - Menus: every screen is vanilla's (title, world list, create world, multiplayer, options, pause). Horizon's own settings hang off vanilla's Options the way mods add theirs: **Horizon Settings...** and **Mods...** in the last two slots of the Options grid (Horizon Settings opens Graphics, Advanced Graphics, Controller Settings, Extras and Mods, each a vanilla options list), with Horizon Graphics and Advanced Graphics also at the top of Video Settings and Controller Settings at the bottom of Controls. The title screen's and pause menu's Friends buttons open Join a Friend and Play with Friends ([play-with-friends.md](play-with-friends.md)).
++- [Play with Steam friends](steam-friends.md): the e4steam mod ported — a singleplayer world opened to a Steam lobby, friends joining over Steam's P2P networking, and the mod's per-Steam-account identity.
+ 
+ ## Parity
+ 
+diff --git a/docs/play-with-friends.md b/docs/play-with-friends.md
+index 2a318c972..c659b26af 100644
+--- a/docs/play-with-friends.md
++++ b/docs/play-with-friends.md
+@@ -6,6 +6,9 @@ Connection takes a full code too; or on the launcher's Play page) and join.
+ There is no Horizon server in the middle and no account: the code itself says where the host is and
+ holds the key that encrypts the game between them.
+ 
++The same screen also offers **Steam sharing** ([steam-friends.md](steam-friends.md)): the world open
++to a Steam lobby, friends joining over Steam's own P2P networking — the e4steam mod, ported.
++
+ It is built on Open to LAN: the integrated server (`crates/horizon-client/src/lan`) listens on a local
+ TCP port and speaks the vanilla protocol. Play with friends puts an encrypted tunnel in front of that
+ port. Neither the integrated server nor the guest's client changes: the tunnel carries exactly the
+diff --git a/docs/steam-friends.md b/docs/steam-friends.md
+new file mode 100644
+index 000000000..1e332ff53
+--- /dev/null
++++ b/docs/steam-friends.md
+@@ -0,0 +1,115 @@
++# Play with Steam friends
++
++A Horizon port of [e4steam](https://github.com/Kamilhik/e4steam), the mod that
++opens a Minecraft singleplayer world to Steam friends without port forwarding
++or a public IP. Java mod jars do not run on Horizon, so what the mod does is
++implemented natively: the host's world opens to a **Steam lobby**, friends
++join from a Steam invitation or the world's address, and the game's stream
++travels over **Steam's P2P networking** — direct when it can, through Valve's
++relays when not — between the two ends of the integrated server, exactly the
++shape Play with Friends ([play-with-friends.md](play-with-friends.md)) carries
++its invite-code sessions. The implementation lives in `crates/horizon-steam`;
++the client's part is `game/steam_friends.rs` and `game/friends.rs`.
++
++Like the mod, Horizon permanently uses **Valve's shared test App ID 480**
++(Spacewar), so no Steam app of its own is needed — and foreign App ID 480
++traffic is filtered: a lobby without Horizon's metadata is refused on join,
++and a P2P connection from an account with no seat in the lobby is refused on
++connect.
++
++## What carries over from the mod
++
++| The mod's behaviour | The port |
++| --- | --- |
++| App ID 480, filtering unrelated traffic | Same App ID; lobby metadata (`horizon_protocol`, `horizon_game`, `horizon_host`) gates joins, lobby membership gates connections |
++| "Open to LAN → Steam friends" / "Invitation only" | Play with Friends' Steam section: **Open to Steam Friends** (a friends lobby) and **Invitation Only** (a private lobby; invitations go through the Steam overlay's invite dialog) |
++| "Invite friends" opens the Steam overlay | The same, through the SDK's invite-dialog entry point |
++| Stable identity per Steam account (0.3.0+) | The mod's own scheme: name `s_<steamid in base 36>`, UUID v3 of `e4steam:steam-identity:v1:<steamid>` — so a guest's progress follows their Steam account, and worlds first played through the Java mod map to the same UUIDs |
++| The host never trusts the connecting client's name | The host's tunnel reads the guest's first packets and refuses a login name that isn't the connecting Steam account's |
++| One TCP stream per guest over Steam P2P | One Steam networking-sockets connection per guest, pumped to the integrated server's loopback port (virtual port 480, as the mod's dedicated transport) |
++| Dedicated servers (`d-...steam`, anonymous GameServer sign-in) | **Not ported** — a follow-up; Horizon's servers have their own hosting story |
++| UDP voice-chat bridge (Java voice mods) | **Not ported** — Horizon has no Java voice mods |
++
++Cross-play with the Java mod is impossible in both directions (Horizon runs
++none of its Java code), so the shared scheme above is about worlds and
++identity, not interconnection.
++
++## Playing
++
++**Host.** Open a singleplayer world, pause, **Play with Friends** (the Friends
++button). The Steam section (there when Steam is signed in) offers **Open to
++Steam Friends** and **Invitation Only**. Starting it opens the world to LAN if
++it isn't (with Open to LAN's defaults), creates the lobby, and shows the
++world's Steam address — `steam:<lobby id>`, copyable, and pasteable into
++Direct Connection (a bare lobby id pasted there works too). **Invite
++Friends...** opens the Steam overlay's invite dialog; invited friends get
++Steam's own invitation, and accepting it while Horizon runs joins from the
++title screen. **Stop** closes the lobby; sessions already playing go on until
++the world closes, as with the invite code.
++
++**Guest.** Accept the Steam invitation (Horizon joins from the title screen),
++or paste the host's `steam:<id>` address — in Direct Connection, or after the
++title screen's Friends button in Join a Friend. The guest joins the lobby,
++checks it is a Horizon world of the same game version (the mismatch message
++names both versions, as the relay's does), connects over Steam's P2P network,
++and logs in under the name of their own Steam account. Guests over Steam are
++LAN guests to the world: 8 players at once, the same as Open to LAN.
++
++No router changes, no relay, no VPN: Steam carries the traffic, as it does for
++every Steam game's multiplayer. Both players need Steam running and signed in;
++the usual Steam troubleshooting (`SteamAPI_Init failed`) applies, as
++[e4steam's guide](https://github.com/Kamilhik/e4steam/blob/main/docs/STEAM_TROUBLESHOOTING.md)
++describes it.
++
++## Building and shipping
++
++The code is always compiled (`cargo test` covers it); linking Steam happens
++only with the client's `steam` feature:
++
++```sh
++cargo build --release -p horizon-client --features steam
++```
++
++The feature links the Steamworks SDK redistributable the `steamworks` crate
++bundles, so the game exe needs the library beside it at run time. For a dev
++build, copy it from the crate's own package (the same files e4steam ships
++inside its jars):
++
++- Windows: `steam_api64.dll` from
++  `%CARGO_HOME%\registry\src\*\steamworks-sys-0.13.0\lib\steam\redistributable_bin\win64\`
++  beside `target\release\horizon-client.exe`.
++
++A build **without** the feature (dev builds, tests, the server build) needs
++nothing: the Steam section simply isn't offered, `steam:` addresses report
++"This build doesn't have Steam sharing.", and the game plays exactly as
++vanilla 26.3.
++
++**Releases are not wired up yet, on purpose.** Horizon's release binaries must
++link only system libraries (`tools/check_imports.py`, enforced in the release
++workflow), and a statically imported `steam_api` would fail that check — the
++mod itself loads the same library dynamically for the same reason. Turning the
++feature on in releases takes one of:
++
++1. ship the redistributable beside the game and teach `check_imports.py` that
++   this one is shipped with the folder (the smallest change, but the check's
++   "no non-system DLL" rule exists for a reason);
++2. load the library at run time with `libloading` and hand-write the flat C
++   bindings and callback dispatch (e4steam's own approach over JNA — no link
++   at all, the most work);
++3. link Steam into a small companion library of our own ABI that the game
++   loads at run time (upstream-tested FFI stays, one extra shipped file).
++
++Until one of these lands, release builds ship without Steam sharing and the
++feature is a developer- and fork-facing one.
++
++## Testing
++
++`cargo test -p horizon-steam` covers everything that doesn't need Steam: the
++identity derivation (vectors computed against the Java algorithm, name and
++UUID), the safe-name round trip and its limits, the address parsing, and the
++host's opening check (a real handshake and Hello in pieces, wrong names, a
++status ping, garbage). The lobby, the P2P connection and the overlay need a
++signed-in Steam client and two accounts; manual coverage so far is the
++single-machine loop (`--baseline`-style) and none of the two-account matrix —
++the same state e4steam's own manual matrix started from, and recorded in its
++[COMPATIBILITY.md](https://github.com/Kamilhik/e4steam/blob/main/COMPATIBILITY.md).
+-- 
+2.55.0.windows.5
+
