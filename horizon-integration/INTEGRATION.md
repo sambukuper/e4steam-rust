@@ -4,7 +4,7 @@
 whole port, exactly the ones the launcher checkout holds after installing.
 
 - base: `7b8d9d73b` (`fix: show Ely.by skins, including other players' on a
-  server`) on **sambukuper/elyhorizon-launcher** — apply the patch onto that
+  server`) on **sambukuper/elyhorizon-launcher**: apply the patch onto that
   commit, or any descendant that doesn't touch the same files yet;
 - `0001` **Add horizon-steam**: the crate (runtime, host share, guest join,
   identity, join guard) and its entry in the workspace;

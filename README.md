@@ -2,7 +2,7 @@
 
 # e4steam-rust
 
-### Steam friends multiplayer for [elyhorizon-launcher](https://github.com/sambukuper/elyhorizon-launcher) — [e4steam](https://github.com/Kamilhik/e4steam), ported to Rust
+### Steam friends multiplayer for [elyhorizon-launcher](https://github.com/sambukuper/elyhorizon-launcher): [e4steam](https://github.com/Kamilhik/e4steam), ported to Rust
 
 **English** · [🇷🇺 Русский](#русская-версия)
 
@@ -11,8 +11,8 @@
 e4steam opens a Minecraft singleplayer world to Steam friends without port
 forwarding or a public IP: a Steam lobby carries the invitation, Steam's P2P
 networking carries the game. The original mod is Java (Fabric / Forge /
-NeoForge). Horizon — Minecraft 26.3 rewritten in Rust — cannot run Java mods,
-so this project is the mod's behaviour implemented natively in Rust.
+NeoForge). Horizon cannot run Java mods: it is Minecraft 26.3 rewritten in
+Rust. So this project implements the mod's behaviour natively in Rust.
 
 One command installs it into an elyhorizon-launcher checkout and builds it:
 
@@ -38,16 +38,16 @@ it), and Steam running and signed in.
   *Invitation Only* (a private lobby; invitations through the Steam overlay's
   invite dialog).
 - **Identity**: a guest is `s_<steamid in base 36>` with the UUID the mod
-  derives from the SteamID — stable per Steam account, never the name a
+  derives from the SteamID: stable per Steam account, never the name a
   client sends, and the host checks it on every join.
 - One Steam networking-sockets connection per guest on the mod's own virtual
   port 480, pumped to the integrated server's LAN port.
 
 Not ported (yet): the dedicated-server Steam mode (`d-...steam` addresses)
 and the UDP voice-chat bridge. Cross-play with the Java mod is impossible in
-both directions — Horizon runs none of its Java code.
+both directions: Horizon runs none of its Java code.
 
-In game: open a world, pause, **Play with Friends** — the Steam section opens
+In game: open a world, pause, **Play with Friends**. The Steam section opens
 the world to Steam friends; guests join from a Steam invitation or the
 world's `steam:<lobby id>` address. Full documentation:
 [horizon-integration/INTEGRATION.md](horizon-integration/INTEGRATION.md) and
@@ -69,8 +69,8 @@ exactly the commits it holds.
 
 e4steam открывает одиночный мир Minecraft друзьям из Steam без проброса
 портов: приглашение несёт Steam-лобби, а сам игровой трафик идёт через P2P-сеть
-Steam. Оригинальный мод — Java (Fabric / Forge / NeoForge); Horizon —
-Minecraft 26.3, переписанный на Rust, — Java-моды не запускает, поэтому этот
+Steam. Оригинальный мод написан на Java (Fabric / Forge / NeoForge). Horizon
+не запускает Java-моды: это Minecraft 26.3, переписанный на Rust. Поэтому этот
 проект повторяет поведение мода нативно, на Rust.
 
 Установка в elyhorizon-launcher одной командой:
@@ -84,22 +84,22 @@ irm https://raw.githubusercontent.com/sambukuper/e4steam-rust/main/install.ps1 |
 накатывает порт коммитами через `git am` (пропускает, если он уже стоит),
 собирает `horizon-client` с фичей `steam` и кладёт библиотеку Steamworks
 (`steam_api64.dll`) рядом с игрой. Параметры: `-LauncherDir <путь>` для
-существующей копии, `-SkipBuild` — только интеграция без сборки.
+существующей копии, `-SkipBuild`, если нужно только внедрить без сборки.
 
 Нужно: Windows x64, git, Rust 1.90+ ([rustup](https://rustup.rs)), своя копия
 Minecraft: Java Edition 26.3 (лаунчер готовит из неё ресурсы игры) и
 запущенный Steam со входом.
 
-Как в игре: откройте мир, пауза, **Play with Friends** — секция Steam открывает
+Как в игре: откройте мир, пауза, **Play with Friends**. Секция Steam открывает
 мир друзьям Steam; гости подключаются по приглашению Steam или по адресу мира
 `steam:<id лобби>`.
 
 ## Credits and license
 
 - [e4steam](https://github.com/Kamilhik/e4steam) by Kamilchik and K2 Studio
-  (Apache-2.0) — the mod this port reimplements; the App ID, the identity
+  (Apache-2.0), the mod this port reimplements; the App ID, the identity
   scheme and the virtual port are its.
-- [Horizon](https://github.com/horizon-rust/horizon) — the game and the
+- [Horizon](https://github.com/horizon-rust/horizon): the game and the
   launcher this integrates into; this repository's code follows its GPL-3.0-only
   licence ([LICENSE](LICENSE)).
 - Not an official Minecraft product; not affiliated with Valve, Mojang or
