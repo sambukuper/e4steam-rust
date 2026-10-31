@@ -2,7 +2,7 @@
 name = "horizon-steam"
 version = "0.1.0"
 edition = "2024"
-license = "GPL-3.0-only"
+license = "MIT"
 description = "Play with Steam friends: e4steam's Steam P2P multiplayer, ported to Horizon (a lobby carries the invite, Steam networking sockets carry the game)"
 
 [dependencies]

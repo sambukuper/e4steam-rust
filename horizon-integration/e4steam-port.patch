@@ -121,7 +121,7 @@ index d796da834..b6394a9be 100644
      "crates/horizon-mods/tests/guest",
 diff --git a/crates/horizon-steam/Cargo.toml b/crates/horizon-steam/Cargo.toml
 new file mode 100644
-index 000000000..6436f8ff7
+index 000000000..3c4d3995e6436f8ff7
 --- /dev/null
 +++ b/crates/horizon-steam/Cargo.toml
 @@ -0,0 +1,18 @@
@@ -129,7 +129,7 @@ index 000000000..6436f8ff7
 +name = "horizon-steam"
 +version = "0.1.0"
 +edition = "2024"
-+license = "GPL-3.0-only"
++license = "MIT"
 +description = "Play with Steam friends: e4steam's Steam P2P multiplayer, ported to Horizon (a lobby carries the invite, Steam networking sockets carry the game)"
 +
 +[dependencies]

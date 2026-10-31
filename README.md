@@ -98,9 +98,10 @@ Minecraft: Java Edition 26.3 (лаунчер готовит из неё ресу
 
 - [e4steam](https://github.com/Kamilhik/e4steam) by Kamilchik and K2 Studio
   (Apache-2.0), the mod this port reimplements; the App ID, the identity
-  scheme and the virtual port are its.
+  scheme and the virtual port are its. This port's own code is MIT
+  ([LICENSE](LICENSE)).
 - [Horizon](https://github.com/horizon-rust/horizon): the game and the
-  launcher this integrates into; this repository's code follows its GPL-3.0-only
-  licence ([LICENSE](LICENSE)).
+  launcher this integrates into, GPLv3. The integration patch touches
+  Horizon's sources, so a game built with the port stays GPLv3.
 - Not an official Minecraft product; not affiliated with Valve, Mojang or
   Microsoft.
